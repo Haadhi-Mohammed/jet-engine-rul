@@ -1,0 +1,32 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Data files
+data/raw/
+data/processed/*.npy
+data/processed/*.pkl
+
+# Model files (large)
+models/*.h5
+models/*.keras
+
+# Environment variables
+.env
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# MLflow
+mlruns/
+notebooks/mlflow.db
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
