@@ -1,4 +1,4 @@
-tensorflow==2.15.0
+tensorflow
 fastapi==0.135.3
 uvicorn==0.43.0
 shap==0.51.0
