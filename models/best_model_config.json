@@ -1,0 +1,49 @@
+{
+  "architecture": {
+    "n_gru_layers": 2,
+    "gru_units": 64,
+    "lstm_units": 32,
+    "dropout_rate": 0.2,
+    "l2_reg": 0.001
+  },
+  "training": {
+    "learning_rate": 0.001,
+    "batch_size": 256,
+    "best_epoch": 23
+  },
+  "performance": {
+    "test_rmse": 14.0662,
+    "test_mae": 10.1152,
+    "test_r2": 0.8768
+  },
+  "data": {
+    "feature_cols": [
+      "s_2",
+      "s_3",
+      "s_4",
+      "s_7",
+      "s_8",
+      "s_9",
+      "s_11",
+      "s_12",
+      "s_13",
+      "s_14",
+      "s_15",
+      "s_17",
+      "s_20",
+      "s_21"
+    ],
+    "sequence_length": 30,
+    "n_features": 14,
+    "rul_cap": 125,
+    "sensors_dropped": [
+      "s_1",
+      "s_5",
+      "s_6",
+      "s_10",
+      "s_16",
+      "s_18",
+      "s_19"
+    ]
+  }
+}
