@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 # ---- config ----
-API_URL = "http://localhost:8001"  # change to Render URL after deployment
+API_URL = "https://jet-engine-rul-api.onrender.com"
 
 st.set_page_config(
     page_title="Jet Engine Fleet Monitor",
