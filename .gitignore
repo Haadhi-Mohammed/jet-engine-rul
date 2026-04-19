@@ -10,10 +10,6 @@ data/raw/
 data/processed/*.npy
 data/processed/*.pkl
 
-# Model files (large)
-models/*.h5
-models/*.keras
-
 # Environment variables
 .env
 
