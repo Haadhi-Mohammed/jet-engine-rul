@@ -46,7 +46,7 @@ st.markdown("""
 @st.cache_data(ttl=60)  # refresh every 60 seconds
 def fetch_fleet():
     try:
-        r = requests.get(f"{API_URL}/fleet", timeout=10)
+        r = requests.get(f"{API_URL}/fleet", timeout=60)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -59,7 +59,7 @@ def fetch_prediction(engine_id, readings):
         r = requests.post(
             f"{API_URL}/predict",
             json={"engine_id": engine_id, "readings": readings},
-            timeout=30
+            timeout=60
         )
         r.raise_for_status()
         return r.json()
@@ -294,8 +294,16 @@ else:
         import pickle
         from pathlib import Path
 
-        MODELS_DIR = Path(__file__).parent.parent / 'models'
-        DATA_DIR   = Path(__file__).parent.parent / 'data' / 'processed'
+        # detect if running on HuggingFace or locally
+        if (Path(__file__).parent / 'feature_cols.pkl').exists():
+            MODELS_DIR = Path(__file__).parent          # HuggingFace
+        else:
+            MODELS_DIR = Path(__file__).parent.parent / 'models'  # local
+        # detect if running on HuggingFace or locally
+        if (Path(__file__).parent / 'X_test.npy').exists():
+            DATA_DIR = Path(__file__).parent          # HuggingFace
+        else:
+            DATA_DIR = Path(__file__).parent.parent / 'data' / 'processed'  # local
 
         X_test = np.load(DATA_DIR / 'X_test.npy')   # (100, 30, 14)
         y_test = np.load(DATA_DIR / 'y_test.npy')
