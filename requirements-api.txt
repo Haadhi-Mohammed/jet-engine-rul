@@ -1,8 +1,11 @@
-tensorflow
-fastapi
-uvicorn
-shap
-numpy
-scikit-learn
-pydantic
-python-dotenv
+# Runtime deps for the FastAPI service (Render).
+# Pinned to the exact versions the model/scaler were created with —
+# best_model.keras needs Keras 3, scaler.pkl was pickled by scikit-learn 1.8.
+tensorflow==2.21.0
+keras==3.14.0
+shap==0.51.0
+scikit-learn==1.8.0
+numpy==2.4.4
+fastapi==0.136.0
+uvicorn==0.44.0
+pydantic==2.13.2

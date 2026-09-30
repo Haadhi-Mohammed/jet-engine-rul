@@ -26,3 +26,6 @@ notebooks/mlflow.db
 # Windows
 Thumbs.db
 desktop.ini
+
+# HuggingFace Space — separate git repo, deployed on its own
+hf-space/
