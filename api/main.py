@@ -69,6 +69,9 @@ print("SHAP explainer ready")
 fleet_preds = np.load(MODELS_DIR / 'y_pred_test.npy')
 print(f"fleet predictions loaded — {len(fleet_preds)} engines")
 
+# last 30 cycles per fleet engine, already scaled — used by /engines/{id}/explain
+fleet_sequences = np.load(MODELS_DIR / 'fleet_sequences.npy')   # (100, 30, 14)
+
 # ---- FastAPI app ----
 app = FastAPI(
     title='Jet Engine RUL Prediction API',
@@ -179,6 +182,31 @@ def compute_shap(sequence: np.ndarray) -> List[ShapValue]:
     ], key=lambda x: x.importance, reverse=True)
 
 
+def predict_sequence(engine_id: int, sequence: np.ndarray) -> PredictResponse:
+    # shared by /predict and /engines/{id}/explain
+    # sequence must already be SCALED, shape (1, 30, 14)
+    raw_pred = model.predict(sequence, verbose=0).flatten()[0]
+    rul = float(np.clip(raw_pred, 0, RUL_CAP))
+
+    alert_level, alert_message = get_alert_level(rul)
+
+    shap_values = []
+    try:
+        shap_values = compute_shap(sequence)
+    except Exception as e:
+        print(f"SHAP error: {str(e)}")
+        # API still returns prediction even if SHAP fails
+
+    return PredictResponse(
+        engine_id=engine_id,
+        predicted_rul=round(rul, 2),
+        alert_level=alert_level,
+        alert_message=alert_message,
+        shap_values=shap_values,
+        model_version='run_02_v1.0'
+    )
+
+
 # ---- endpoints ----
 @app.get('/')
 def root():
@@ -208,34 +236,23 @@ def predict(request: PredictRequest):
         )
 
     try:
+        # raw readings from the caller → scale here, then predict
         sequence = preprocess_readings(request.readings)
-
-        # RUL prediction
-        raw_pred = model.predict(sequence, verbose=0).flatten()[0]
-        rul = float(np.clip(raw_pred, 0, RUL_CAP))
-
-        # alert level
-        alert_level, alert_message = get_alert_level(rul)
-
-        # SHAP explanation
-        shap_values = []
-        try:
-            shap_values = compute_shap(sequence)
-        except Exception as e:
-            print(f"SHAP error: {str(e)}")
-            # API still returns prediction even if SHAP fails
-
-        return PredictResponse(
-            engine_id=request.engine_id,
-            predicted_rul=round(rul, 2),
-            alert_level=alert_level,
-            alert_message=alert_message,
-            shap_values=shap_values,
-            model_version='run_02_v1.0'
-        )
+        return predict_sequence(request.engine_id, sequence)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/engines/{engine_id}/explain', response_model=PredictResponse)
+def explain_engine(engine_id: int):
+    # prediction + SHAP for a fleet engine, using its stored (already scaled) sensor window.
+    # the dashboard uses this, so it never has to handle scaling itself.
+    if not 1 <= engine_id <= len(fleet_sequences):
+        raise HTTPException(status_code=404, detail=f"Engine {engine_id} not found")
+
+    sequence = fleet_sequences[engine_id - 1][np.newaxis]   # (1, 30, 14)
+    return predict_sequence(engine_id, sequence)
 
 
 @app.get('/fleet', response_model=FleetResponse)

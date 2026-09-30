@@ -1,6 +1,7 @@
 # Streamlit fleet dashboard for Jet Engine RUL Prediction
 # two views: fleet overview + individual engine drill-down
 
+import os
 import streamlit as st
 import requests
 import pandas as pd
@@ -9,7 +10,8 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 # ---- config ----
-API_URL = "https://jet-engine-rul-api.onrender.com"
+# override with RUL_API_URL=http://localhost:8001 to test against a local API
+API_URL = os.environ.get("RUL_API_URL", "https://jet-engine-rul-api.onrender.com")
 
 st.set_page_config(
     page_title="Jet Engine Fleet Monitor",
@@ -54,15 +56,17 @@ def fetch_fleet():
         return None
 
 
-def fetch_prediction(engine_id, readings):
+@st.cache_data(ttl=3600)  # fleet data is static — no need to recompute SHAP on every rerun
+def _get_explanation(engine_id):
+    # raises on failure — Streamlit doesn't cache exceptions, so errors get retried
+    r = requests.get(f"{API_URL}/engines/{engine_id}/explain", timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_explanation(engine_id):
     try:
-        r = requests.post(
-            f"{API_URL}/predict",
-            json={"engine_id": engine_id, "readings": readings},
-            timeout=60
-        )
-        r.raise_for_status()
-        return r.json()
+        return _get_explanation(engine_id)
     except Exception as e:
         st.error(f"Prediction failed: {e}")
         return None
@@ -393,34 +397,10 @@ else:
             st.subheader("SHAP — Sensor Importance")
             st.markdown("*Which sensors are driving this prediction?*")
 
-            # compute SHAP live for this engine via API
-            # building a dummy request using the scaled sensor values
-            # converting back to approximate raw values for the API
-            # (in production the API would receive raw sensor data)
-
-            # for the dashboard we call /predict with the scaled sequence
-            # reusing the scaled X_test data directly
-            readings = []
-            for cycle in engine_seq:
-                readings.append({
-                    's_2':  float(cycle[feature_cols.index('s_2')]),
-                    's_3':  float(cycle[feature_cols.index('s_3')]),
-                    's_4':  float(cycle[feature_cols.index('s_4')]),
-                    's_7':  float(cycle[feature_cols.index('s_7')]),
-                    's_8':  float(cycle[feature_cols.index('s_8')]),
-                    's_9':  float(cycle[feature_cols.index('s_9')]),
-                    's_11': float(cycle[feature_cols.index('s_11')]),
-                    's_12': float(cycle[feature_cols.index('s_12')]),
-                    's_13': float(cycle[feature_cols.index('s_13')]),
-                    's_14': float(cycle[feature_cols.index('s_14')]),
-                    's_15': float(cycle[feature_cols.index('s_15')]),
-                    's_17': float(cycle[feature_cols.index('s_17')]),
-                    's_20': float(cycle[feature_cols.index('s_20')]),
-                    's_21': float(cycle[feature_cols.index('s_21')]),
-                })
-
+            # the API holds each fleet engine's sensor window and does its own scaling,
+            # so the dashboard only needs to send the engine id
             with st.spinner("Computing SHAP..."):
-                pred = fetch_prediction(selected_id, readings)
+                pred = fetch_explanation(selected_id)
 
             if pred and pred.get('shap_values'):
                 shap_df = pd.DataFrame(pred['shap_values'])
