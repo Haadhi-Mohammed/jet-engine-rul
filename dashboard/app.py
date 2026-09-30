@@ -21,24 +21,28 @@ st.set_page_config(
 )
 
 # ---- custom CSS ----
+# semi-transparent tints + inherited text colour, so every card reads well in
+# both Streamlit's light and dark themes (solid pastels + grey text don't)
 st.markdown("""
 <style>
-    .metric-red   { background:#fff0f0; border-left:4px solid #e53e3e;
-                    padding:12px 16px; border-radius:8px; margin:4px 0; }
-    .metric-amber { background:#fffbeb; border-left:4px solid #d69e2e;
-                    padding:12px 16px; border-radius:8px; margin:4px 0; }
-    .metric-green { background:#f0fff4; border-left:4px solid #38a169;
-                    padding:12px 16px; border-radius:8px; margin:4px 0; }
+    .metric-red, .metric-amber, .metric-green, .metric-neutral {
+                    padding:12px 16px; border-radius:8px; margin:4px 0; border-left:4px solid; }
+    .metric-red     { background:rgba(229,62,62,0.12);   border-left-color:#e53e3e; }
+    .metric-amber   { background:rgba(214,158,46,0.12);  border-left-color:#d69e2e; }
+    .metric-green   { background:rgba(56,161,105,0.12);  border-left-color:#38a169; }
+    .metric-neutral { background:rgba(128,128,128,0.10); border-left-color:#718096; }
     .metric-value { font-size:2rem; font-weight:700; line-height:1; }
-    .metric-label { font-size:0.85rem; color:#666; margin-top:4px; }
+    .metric-label { font-size:0.85rem; opacity:0.75; margin-top:4px; }
+    .muted        { opacity:0.7; }
+    .panel        { background:rgba(128,128,128,0.08); border-radius:8px; }
     .badge-red    { background:#e53e3e; color:white; padding:2px 10px;
                     border-radius:12px; font-size:0.78rem; font-weight:600; }
     .badge-amber  { background:#d69e2e; color:white; padding:2px 10px;
                     border-radius:12px; font-size:0.78rem; font-weight:600; }
     .badge-green  { background:#38a169; color:white; padding:2px 10px;
                     border-radius:12px; font-size:0.78rem; font-weight:600; }
-    .engine-card  { border:1px solid #e2e8f0; border-radius:10px;
-                    padding:16px; margin:6px 0; background:white; }
+    .engine-card  { border:1px solid rgba(128,128,128,0.3); border-radius:10px;
+                    padding:16px; margin:6px 0; }
     .stButton>button { width:100%; }
 </style>
 """, unsafe_allow_html=True)
@@ -70,7 +74,9 @@ def badge(level):
 
 
 # ---- model metadata — thresholds, RUL cap, metrics all come from the API ----
-meta = api_get("/")
+# the API is on a free tier that sleeps when idle — the first request can take ~1 minute
+with st.spinner("Connecting to the prediction API… (first load can take up to a minute while it wakes up)"):
+    meta = api_get("/")
 if not meta:
     st.stop()
 
@@ -149,7 +155,7 @@ if view == "Fleet Overview":
 
     with c4:
         st.markdown(f"""
-        <div class="metric-green">
+        <div class="metric-neutral">
             <div class="metric-value">{fleet['total_engines']}</div>
             <div class="metric-label">Total engines monitored</div>
         </div>""", unsafe_allow_html=True)
@@ -157,8 +163,14 @@ if view == "Fleet Overview":
     st.divider()
 
     # ---- build dataframe ----
-    df = pd.DataFrame(fleet['engines'])
-    df.columns = ['Engine ID', 'Predicted RUL', 'Alert Level', 'Message']
+    # rename by name, not position — adding a field to the API can't shift the labels
+    df = pd.DataFrame(fleet['engines']).rename(columns={
+        'engine_id':     'Engine ID',
+        'predicted_rul': 'Predicted RUL',
+        'actual_rul':    'Actual RUL',
+        'alert_level':   'Alert Level',
+        'alert_message': 'Message',
+    })
 
     col_left, col_right = st.columns([1.2, 1])
 
@@ -187,16 +199,23 @@ if view == "Fleet Overview":
 
         # colour-coded table
         def highlight_row(row):
-            color_map = {'RED': '#fff0f0', 'AMBER': '#fffbeb', 'GREEN': '#f0fff4'}
-            color = color_map.get(row['Alert Level'], 'white')
+            color_map = {'RED':   'rgba(229,62,62,0.15)',
+                         'AMBER': 'rgba(214,158,46,0.15)',
+                         'GREEN': 'rgba(56,161,105,0.15)'}
+            color = color_map.get(row['Alert Level'], 'transparent')
             return [f'background-color: {color}'] * len(row)
 
         st.dataframe(
-            df_filtered[['Engine ID', 'Predicted RUL', 'Alert Level']].style.apply(
+            df_filtered[['Engine ID', 'Predicted RUL', 'Actual RUL', 'Alert Level']].style.apply(
                 highlight_row, axis=1
-            ).format({'Predicted RUL': '{:.1f}'}),
-            use_container_width=True,
-            height=480
+            ).format({'Predicted RUL': '{:.1f}', 'Actual RUL': '{:.0f}'}),
+            width='stretch',
+            height=480,
+            hide_index=True
+        )
+        st.caption(
+            "Actual RUL is known here because these are NASA's benchmark test engines — "
+            f"a real fleet wouldn't have it. The model's predictions are capped at {RUL_CAP} cycles."
         )
 
     with col_right:
@@ -221,7 +240,7 @@ if view == "Fleet Overview":
             showlegend=True,
             height=220
         )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, width='stretch')
 
         # donut chart
         st.subheader("Fleet Health")
@@ -229,7 +248,7 @@ if view == "Fleet Overview":
             labels=['Critical (RED)', 'Warning (AMBER)', 'Healthy (GREEN)'],
             values=[fleet['red_count'], fleet['amber_count'], fleet['green_count']],
             hole=0.6,
-            marker_colors=['#e53e3e', '#d69e2e', '#38a169'],
+            marker_colors=[LEVEL_COLORS['RED'], LEVEL_COLORS['AMBER'], LEVEL_COLORS['GREEN']],
             textinfo='percent+label',
             textfont_size=11
         )])
@@ -238,7 +257,7 @@ if view == "Fleet Overview":
             showlegend=False,
             height=220
         )
-        st.plotly_chart(fig_donut, use_container_width=True)
+        st.plotly_chart(fig_donut, width='stretch')
 
     # ---- critical engines callout ----
     critical = df[df['Alert Level'] == 'RED'].sort_values('Predicted RUL').head(5)
@@ -252,7 +271,7 @@ if view == "Fleet Overview":
                 <div class="engine-card" style="border-left:4px solid #e53e3e;">
                     <div style="font-size:1.3rem;font-weight:700">Engine {int(row['Engine ID'])}</div>
                     <div style="font-size:2rem;font-weight:700;color:#e53e3e">{row['Predicted RUL']:.1f}</div>
-                    <div style="font-size:0.8rem;color:#666">cycles remaining</div>
+                    <div class="muted" style="font-size:0.8rem">cycles remaining · actual {row['Actual RUL']:.0f}</div>
                 </div>""", unsafe_allow_html=True)
 
 
@@ -284,13 +303,13 @@ else:
 
     with col_sel2:
         st.markdown(f"""
-        <div style="padding:12px;background:#f8f9fa;border-radius:8px;
-                    border-left:5px solid {color};margin-top:4px">
+        <div class="panel" style="padding:12px;border-left:5px solid {color};margin-top:4px">
             <span style="font-size:1.1rem;font-weight:600">Engine {selected_id}</span>
             &nbsp;&nbsp;{badge(level)}&nbsp;&nbsp;
             <span style="font-size:1.5rem;font-weight:700;color:{color}">{rul:.1f} cycles remaining</span>
             &nbsp;&nbsp;
-            <span style="color:#666;font-size:0.9rem">{engine_row['alert_message']}</span>
+            <span class="muted" style="font-size:0.9rem">{engine_row['alert_message']}
+                · actual RUL {engine_row['actual_rul']:.0f}</span>
         </div>""", unsafe_allow_html=True)
 
     st.divider()
@@ -347,7 +366,7 @@ else:
                 margin=dict(t=10, b=60, l=10, r=10),
                 height=320
             )
-            st.plotly_chart(fig_sensors, use_container_width=True)
+            st.plotly_chart(fig_sensors, width='stretch')
 
             # RUL gauge
             st.subheader("RUL Gauge")
@@ -376,7 +395,7 @@ else:
                 margin=dict(t=30, b=10, l=30, r=30),
                 height=220
             )
-            st.plotly_chart(fig_gauge, use_container_width=True)
+            st.plotly_chart(fig_gauge, width='stretch')
 
         with col_shap:
             st.subheader("SHAP — Sensor Importance")
@@ -403,22 +422,26 @@ else:
                     margin=dict(t=10, b=20, l=10, r=60),
                     height=340
                 )
-                st.plotly_chart(fig_shap, use_container_width=True)
+                st.plotly_chart(fig_shap, width='stretch')
 
                 # maintenance recommendation
+                # SHAP says which sensor most influenced the prediction — not
+                # which part is physically degrading, so word it that way
                 top_sensor = shap_df.iloc[0]['sensor']
+                action = {
+                    'RED':   'Immediate inspection recommended.',
+                    'AMBER': 'Schedule within next maintenance window.',
+                    'GREEN': 'Continue standard monitoring.',
+                }[level]
                 st.markdown(f"""
-                <div style="background:#fff8f0;border-left:4px solid {color};
-                            padding:14px;border-radius:8px;margin-top:8px">
+                <div class="panel" style="border-left:4px solid {color};padding:14px;margin-top:8px">
                     <div style="font-weight:600;margin-bottom:6px">
                         🔧 Maintenance Recommendation
                     </div>
-                    <div style="font-size:0.9rem;color:#444">
-                        Engine {selected_id} shows strongest degradation signal in
-                        <strong>{top_sensor}</strong>.
-                        Predicted RUL: <strong>{rul:.1f} cycles</strong>.
-                        {'<span style="color:#e53e3e;font-weight:600"> Immediate inspection recommended.</span>' if level == 'RED'
-                         else '<span style="color:#d69e2e;font-weight:600"> Schedule within next maintenance window.</span>' if level == 'AMBER'
-                         else '<span style="color:#38a169;font-weight:600"> Continue standard monitoring.</span>'}
+                    <div style="font-size:0.9rem">
+                        Predicted RUL for engine {selected_id}: <strong>{rul:.1f} cycles</strong>.
+                        <span style="color:{color};font-weight:600">{action}</span><br>
+                        <span class="muted">Sensor with the most influence on this prediction:
+                        <strong>{top_sensor}</strong>.</span>
                     </div>
                 </div>""", unsafe_allow_html=True)
