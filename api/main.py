@@ -3,9 +3,10 @@
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 from typing import List
 import numpy as np
+import pandas as pd
 import pickle
 import json
 import shap
@@ -13,28 +14,19 @@ from pathlib import Path
 import uvicorn
 
 import tensorflow as tf
-from tensorflow.keras.layers import Layer, LayerNormalization
+
+from rul.alerts import get_alert_level
+from rul.config import RED_BELOW, AMBER_BELOW
+from rul.layers import CUSTOM_OBJECTS
 
 # ---- paths ----
 BASE_DIR   = Path(__file__).parent.parent
 MODELS_DIR = BASE_DIR / 'models'
 
-# ---- custom layer — must be defined before model load ----
-class ScaledDotProductAttention(Layer):
-    # same class as training — needed to deserialise best_model.keras
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.layer_norm = LayerNormalization()
-
-    def call(self, x):
-        d_k     = tf.cast(tf.shape(x)[-1], tf.float32)
-        scale   = tf.math.sqrt(d_k)
-        scores  = tf.matmul(x, x, transpose_b=True) / scale
-        weights = tf.nn.softmax(scores, axis=-1)
-        context = tf.matmul(weights, x)
-        return self.layer_norm(x + context)
-
 # ---- load model config ----
+# the API trusts the artifacts saved next to the model (not rul.config),
+# because they describe how THIS model was trained. tests/test_rul.py
+# checks the two never disagree.
 with open(MODELS_DIR / 'model_config.pkl', 'rb') as f:
     config = pickle.load(f)
 
@@ -52,10 +44,24 @@ RUL_CAP         = config['rul_cap']
 with open(MODELS_DIR / 'scaler.pkl', 'rb') as f:
     scaler = pickle.load(f)
 
+# fail fast: refuse to start rather than silently feed sensors in the wrong order
+if list(scaler.feature_names_in_) != feature_cols:
+    raise RuntimeError(
+        f"scaler.pkl was fitted on {list(scaler.feature_names_in_)}, "
+        f"but feature_cols.pkl says {feature_cols}"
+    )
+
+# ---- model metadata — read from the artifacts, never hardcoded ----
+_arch        = best_config['architecture']
+MODEL_NAME   = f"{_arch['n_gru_layers']}GRU({_arch['gru_units']})+LSTM({_arch['lstm_units']})+Attention"
+MODEL_VERSION = 'run_02_v1.0'
+_perf        = best_config['performance']
+PERFORMANCE  = f"RMSE {_perf['test_rmse']:.2f} | R² {_perf['test_r2']:.3f}"
+
 # ---- load model ----
 model = tf.keras.models.load_model(
     MODELS_DIR / 'best_model.keras',
-    custom_objects={'ScaledDotProductAttention': ScaledDotProductAttention}
+    custom_objects=CUSTOM_OBJECTS
 )
 print("model loaded successfully")
 
@@ -75,8 +81,8 @@ fleet_sequences = np.load(MODELS_DIR / 'fleet_sequences.npy')   # (100, 30, 14)
 # ---- FastAPI app ----
 app = FastAPI(
     title='Jet Engine RUL Prediction API',
-    description='Predictive maintenance API for NASA CMAPSS turbofan engines. '
-                'RMSE 14.07 | R² 0.877 | GRU-LSTM + Attention',
+    description=f'Predictive maintenance API for NASA CMAPSS turbofan engines. '
+                f'{PERFORMANCE} | {MODEL_NAME}',
     version='1.0.0'
 )
 
@@ -89,31 +95,21 @@ app.add_middleware(
 )
 
 # ---- request / response schemas ----
-class SensorReading(BaseModel):
-    # one cycle of sensor readings — 14 values in FEATURE_COLS order
-    s_2:  float
-    s_3:  float
-    s_4:  float
-    s_7:  float
-    s_8:  float
-    s_9:  float
-    s_11: float
-    s_12: float
-    s_13: float
-    s_14: float
-    s_15: float
-    s_17: float
-    s_20: float
-    s_21: float
+# one cycle of raw sensor readings — one float field per model feature.
+# built from feature_cols so the schema can't drift from the model.
+SensorReading = create_model(
+    'SensorReading',
+    **{col: (float, ...) for col in feature_cols}
+)
 
 
 class PredictRequest(BaseModel):
     engine_id: int = Field(..., description="Engine unit number")
     readings: List[SensorReading] = Field(
         ...,
-        min_length=30,
-        max_length=30,
-        description="Exactly 30 consecutive cycles of raw sensor readings"
+        min_length=SEQUENCE_LENGTH,
+        max_length=SEQUENCE_LENGTH,
+        description=f"Exactly {SEQUENCE_LENGTH} consecutive cycles of RAW sensor readings"
     )
 
 
@@ -146,26 +142,22 @@ class FleetResponse(BaseModel):
     engines:       List[EngineStatus]
 
 
+class EngineSensors(BaseModel):
+    engine_id:       int
+    feature_cols:    List[str]
+    # SCALED values (RobustScaler: 0 = training median) — for charts, not for /predict
+    scaled_readings: List[List[float]]
+
+
 # ---- helpers ----
-def get_alert_level(rul: float):
-    # thresholds match dashboard colour coding
-    if rul < 30:
-        return 'RED',   'Immediate maintenance required'
-    elif rul < 60:
-        return 'AMBER', 'Schedule maintenance soon'
-    return 'GREEN', 'Engine healthy'
-
-
 def preprocess_readings(readings: List[SensorReading]) -> np.ndarray:
-    # convert pydantic objects → numpy array → scale → reshape for model
-    raw = np.array([[
-        r.s_2, r.s_3, r.s_4, r.s_7, r.s_8, r.s_9,
-        r.s_11, r.s_12, r.s_13, r.s_14, r.s_15,
-        r.s_17, r.s_20, r.s_21
-    ] for r in readings], dtype=np.float32)    # (30, 14)
-
+    # pydantic objects → DataFrame in feature_cols order → scale → add batch dim
+    raw = pd.DataFrame(
+        [[getattr(r, col) for col in feature_cols] for r in readings],
+        columns=feature_cols
+    )                                          # (30, 14)
     scaled = scaler.transform(raw)             # (30, 14)
-    return scaled.reshape(1, 30, 14)           # (1, 30, 14)
+    return scaled[np.newaxis]                  # (1, 30, 14)
 
 
 def compute_shap(sequence: np.ndarray) -> List[ShapValue]:
@@ -203,7 +195,7 @@ def predict_sequence(engine_id: int, sequence: np.ndarray) -> PredictResponse:
         alert_level=alert_level,
         alert_message=alert_message,
         shap_values=shap_values,
-        model_version='run_02_v1.0'
+        model_version=MODEL_VERSION
     )
 
 
@@ -214,9 +206,15 @@ def root():
         'name':        'Jet Engine RUL Prediction API',
         'version':     '1.0.0',
         'status':      'running',
-        'model':       '2GRU(64)+LSTM(32)+Attention',
+        'model':       MODEL_NAME,
+        'model_version': MODEL_VERSION,
         'performance': best_config['performance'],
         'dataset':     'NASA CMAPSS FD001',
+        # clients (the dashboard) read these instead of hardcoding them
+        'feature_cols':     feature_cols,
+        'sequence_length':  SEQUENCE_LENGTH,
+        'rul_cap':          RUL_CAP,
+        'alert_thresholds': {'red_below': RED_BELOW, 'amber_below': AMBER_BELOW},
     }
 
 
@@ -253,6 +251,20 @@ def explain_engine(engine_id: int):
 
     sequence = fleet_sequences[engine_id - 1][np.newaxis]   # (1, 30, 14)
     return predict_sequence(engine_id, sequence)
+
+
+@app.get('/engines/{engine_id}/sensors', response_model=EngineSensors)
+def engine_sensors(engine_id: int):
+    # the stored sensor window for a fleet engine — lets the dashboard draw
+    # its charts without shipping its own copy of the data
+    if not 1 <= engine_id <= len(fleet_sequences):
+        raise HTTPException(status_code=404, detail=f"Engine {engine_id} not found")
+
+    return EngineSensors(
+        engine_id=engine_id,
+        feature_cols=feature_cols,
+        scaled_readings=fleet_sequences[engine_id - 1].round(4).tolist()
+    )
 
 
 @app.get('/fleet', response_model=FleetResponse)

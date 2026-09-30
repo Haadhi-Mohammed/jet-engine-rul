@@ -45,48 +45,48 @@ st.markdown("""
 
 
 # ---- data fetching ----
-@st.cache_data(ttl=60)  # refresh every 60 seconds
-def fetch_fleet():
-    try:
-        r = requests.get(f"{API_URL}/fleet", timeout=60)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        st.error(f"API connection failed: {e}")
-        return None
-
-
-@st.cache_data(ttl=3600)  # fleet data is static — no need to recompute SHAP on every rerun
-def _get_explanation(engine_id):
+@st.cache_data(ttl=3600)  # fleet data is static — "Refresh Data" clears this
+def _api_get(path):
     # raises on failure — Streamlit doesn't cache exceptions, so errors get retried
-    r = requests.get(f"{API_URL}/engines/{engine_id}/explain", timeout=60)
+    r = requests.get(f"{API_URL}{path}", timeout=60)
     r.raise_for_status()
     return r.json()
 
 
-def fetch_explanation(engine_id):
+def api_get(path):
     try:
-        return _get_explanation(engine_id)
+        return _api_get(path)
     except Exception as e:
-        st.error(f"Prediction failed: {e}")
+        st.error(f"API request failed ({path}): {e}")
         return None
 
 
 # ---- helper ----
+LEVEL_COLORS = {'RED': '#e53e3e', 'AMBER': '#d69e2e', 'GREEN': '#38a169'}
+
+
 def badge(level):
     return f'<span class="badge-{level.lower()}">{level}</span>'
 
 
-def rul_color(rul):
-    if rul < 30:   return '#e53e3e'
-    if rul < 60:   return '#d69e2e'
-    return '#38a169'
+# ---- model metadata — thresholds, RUL cap, metrics all come from the API ----
+meta = api_get("/")
+if not meta:
+    st.stop()
+
+RED_BELOW   = meta['alert_thresholds']['red_below']
+AMBER_BELOW = meta['alert_thresholds']['amber_below']
+RUL_CAP     = meta['rul_cap']
+perf        = meta['performance']
 
 
 # ---- sidebar ----
 st.sidebar.markdown("## ✈️")
 st.sidebar.title("Fleet Monitor")
-st.sidebar.markdown("NASA CMAPSS FD001  \nGRU-LSTM + Attention  \nRMSE 14.07 · R² 0.877")
+st.sidebar.markdown(
+    f"{meta['dataset']}  \n{meta['model']}  \n"
+    f"RMSE {perf['test_rmse']:.2f} · R² {perf['test_r2']:.3f}"
+)
 st.sidebar.divider()
 
 view = st.sidebar.radio(
@@ -114,11 +114,14 @@ st.sidebar.markdown(
 if view == "Fleet Overview":
 
     st.title("✈️ Jet Engine Fleet Monitor")
-    st.markdown("Predictive maintenance dashboard — 100 turbofan engines · NASA CMAPSS FD001")
 
-    fleet = fetch_fleet()
+    fleet = api_get("/fleet")
     if not fleet:
         st.stop()
+
+    st.markdown(
+        f"Predictive maintenance dashboard — {fleet['total_engines']} turbofan engines · {meta['dataset']}"
+    )
 
     # ---- top metrics ----
     c1, c2, c3, c4 = st.columns(4)
@@ -210,8 +213,8 @@ if view == "Fleet Overview":
             },
             labels={'Predicted RUL': 'Predicted RUL (cycles)'}
         )
-        fig_hist.add_vline(x=30, line_dash='dash', line_color='#e53e3e', opacity=0.5)
-        fig_hist.add_vline(x=60, line_dash='dash', line_color='#d69e2e', opacity=0.5)
+        fig_hist.add_vline(x=RED_BELOW,   line_dash='dash', line_color=LEVEL_COLORS['RED'],   opacity=0.5)
+        fig_hist.add_vline(x=AMBER_BELOW, line_dash='dash', line_color=LEVEL_COLORS['AMBER'], opacity=0.5)
         fig_hist.update_layout(
             margin=dict(t=20, b=20, l=10, r=10),
             legend_title_text='',
@@ -260,7 +263,7 @@ else:
     st.title("🔍 Engine Drill-down")
     st.markdown("Select an engine to see detailed sensor analysis and SHAP explanation")
 
-    fleet = fetch_fleet()
+    fleet = api_get("/fleet")
     if not fleet:
         st.stop()
 
@@ -277,7 +280,7 @@ else:
     engine_row = df[df['engine_id'] == selected_id].iloc[0]
     rul   = engine_row['predicted_rul']
     level = engine_row['alert_level']
-    color = rul_color(rul)
+    color = LEVEL_COLORS[level]
 
     with col_sel2:
         st.markdown(f"""
@@ -292,52 +295,34 @@ else:
 
     st.divider()
 
-    # ---- load preprocessed test data for sensor charts ----
-    # loading directly from saved numpy arrays — no API call needed here
-    try:
-        import pickle
-        from pathlib import Path
+    # ---- everything for this engine comes from the API ----
+    # the API holds each fleet engine's sensor window and does its own scaling,
+    # so the dashboard never touches model files or data files
+    with st.spinner("Loading engine data and computing SHAP..."):
+        sensors = api_get(f"/engines/{selected_id}/sensors")
+        pred    = api_get(f"/engines/{selected_id}/explain")
 
-        # detect if running on HuggingFace or locally
-        if (Path(__file__).parent / 'feature_cols.pkl').exists():
-            MODELS_DIR = Path(__file__).parent          # HuggingFace
-        else:
-            MODELS_DIR = Path(__file__).parent.parent / 'models'  # local
-        # detect if running on HuggingFace or locally
-        if (Path(__file__).parent / 'X_test.npy').exists():
-            DATA_DIR = Path(__file__).parent          # HuggingFace
-        else:
-            DATA_DIR = Path(__file__).parent.parent / 'data' / 'processed'  # local
+    if sensors:
+        feature_cols = sensors['feature_cols']
+        engine_seq   = np.array(sensors['scaled_readings'])   # (30, 14)
+        n_cycles     = len(engine_seq)
 
-        X_test = np.load(DATA_DIR / 'X_test.npy')   # (100, 30, 14)
-        y_test = np.load(DATA_DIR / 'y_test.npy')
-
-        with open(MODELS_DIR / 'feature_cols.pkl', 'rb') as f:
-            feature_cols = pickle.load(f)
-
-        # engine index is engine_id - 1
-        engine_idx = selected_id - 1
-        engine_seq = X_test[engine_idx]  # (30, 14)
-
-        data_loaded = True
-    except Exception as e:
-        st.warning(f"Could not load local data: {e}")
-        data_loaded = False
-
-    if data_loaded:
         col_charts, col_shap = st.columns([1.5, 1])
 
         with col_charts:
-            st.subheader("Sensor Trends — Last 30 Cycles")
-            st.markdown("*Scaled values — positive = above normal, negative = below normal*")
+            st.subheader(f"Sensor Trends — Last {n_cycles} Cycles")
+            st.markdown("*Scaled values — 0 = median reading across the training fleet*")
 
-            # top 6 most important sensors based on global SHAP knowledge
-            # s_11, s_12, s_20, s_9, s_7, s_17 from Cell 8 output
-            top_sensors = ['s_11', 's_12', 's_20', 's_9', 's_7', 's_17']
+            # the 6 sensors driving THIS engine's prediction (falls back to
+            # the first 6 features if SHAP is unavailable)
+            if pred and pred.get('shap_values'):
+                top_sensors = [s['sensor'] for s in pred['shap_values'][:6]]
+            else:
+                top_sensors = feature_cols[:6]
             top_indices = [feature_cols.index(s) for s in top_sensors]
 
             fig_sensors = go.Figure()
-            cycles = list(range(1, 31))
+            cycles = list(range(1, n_cycles + 1))
 
             colors_sensors = [
                 '#e53e3e', '#d69e2e', '#38a169',
@@ -354,9 +339,9 @@ else:
                 ))
 
             fig_sensors.add_hline(y=0, line_dash='dash', line_color='gray',
-                                  opacity=0.4, annotation_text='normal baseline')
+                                  opacity=0.4, annotation_text='training median')
             fig_sensors.update_layout(
-                xaxis_title='cycle (last 30)',
+                xaxis_title=f'cycle (last {n_cycles})',
                 yaxis_title='scaled sensor value',
                 legend=dict(orientation='h', y=-0.2),
                 margin=dict(t=10, b=60, l=10, r=10),
@@ -369,19 +354,19 @@ else:
             fig_gauge = go.Figure(go.Indicator(
                 mode='gauge+number+delta',
                 value=rul,
-                delta={'reference': 60, 'valueformat': '.1f'},
+                delta={'reference': AMBER_BELOW, 'valueformat': '.1f'},
                 gauge={
-                    'axis': {'range': [0, 125]},
+                    'axis': {'range': [0, RUL_CAP]},
                     'bar':  {'color': color},
                     'steps': [
-                        {'range': [0, 30],  'color': '#fff0f0'},
-                        {'range': [30, 60], 'color': '#fffbeb'},
-                        {'range': [60, 125],'color': '#f0fff4'},
+                        {'range': [0, RED_BELOW],           'color': '#fff0f0'},
+                        {'range': [RED_BELOW, AMBER_BELOW], 'color': '#fffbeb'},
+                        {'range': [AMBER_BELOW, RUL_CAP],   'color': '#f0fff4'},
                     ],
                     'threshold': {
-                        'line': {'color': '#e53e3e', 'width': 3},
+                        'line': {'color': LEVEL_COLORS['RED'], 'width': 3},
                         'thickness': 0.75,
-                        'value': 30
+                        'value': RED_BELOW
                     }
                 },
                 title={'text': 'Predicted RUL (cycles)'},
@@ -396,11 +381,6 @@ else:
         with col_shap:
             st.subheader("SHAP — Sensor Importance")
             st.markdown("*Which sensors are driving this prediction?*")
-
-            # the API holds each fleet engine's sensor window and does its own scaling,
-            # so the dashboard only needs to send the engine id
-            with st.spinner("Computing SHAP..."):
-                pred = fetch_explanation(selected_id)
 
             if pred and pred.get('shap_values'):
                 shap_df = pd.DataFrame(pred['shap_values'])

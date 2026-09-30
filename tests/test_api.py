@@ -30,6 +30,15 @@ def test_health():
     assert r.json()['status'] == 'healthy'
 
 
+def test_root_exposes_what_clients_need():
+    # the dashboard relies on these keys instead of hardcoding values
+    body = client.get('/').json()
+    assert body['feature_cols'] == api.feature_cols
+    assert body['alert_thresholds'] == {'red_below': 30, 'amber_below': 60}
+    assert body['rul_cap'] == api.RUL_CAP
+    assert body['model'] == '2GRU(64)+LSTM(32)+Attention'
+
+
 def test_fleet_counts_add_up():
     body = client.get('/fleet').json()
     assert body['total_engines'] == len(FLEET_PREDS)
@@ -69,6 +78,14 @@ def test_explain_gives_different_answers_for_different_engines():
     assert len(ruls) == 4
 
 
+@pytest.mark.parametrize('endpoint', ['explain', 'sensors'])
 @pytest.mark.parametrize('engine_id', [0, 101, -3])
-def test_explain_unknown_engine_is_404(engine_id):
-    assert client.get(f'/engines/{engine_id}/explain').status_code == 404
+def test_unknown_engine_is_404(endpoint, engine_id):
+    assert client.get(f'/engines/{engine_id}/{endpoint}').status_code == 404
+
+
+# ---- /engines/{id}/sensors ----
+def test_sensors_returns_the_stored_window():
+    body = client.get('/engines/34/sensors').json()
+    assert body['feature_cols'] == api.feature_cols
+    np.testing.assert_allclose(body['scaled_readings'], FLEET_SEQUENCES[33], atol=1e-4)
