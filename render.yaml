@@ -4,6 +4,9 @@ services:
     runtime: python
     buildCommand: pip install -r requirements-api.txt
     startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    # Render only routes traffic to a new deploy once this returns 200,
+    # so a build that can't load the model never replaces the working one
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0

@@ -16,6 +16,12 @@ class ScaledDotProductAttention(Layer):
         super().__init__(**kwargs)
         self.layer_norm = LayerNormalization()
 
+    def build(self, input_shape):
+        # sublayers must be built explicitly so their weights exist before
+        # Keras restores them from a saved model
+        self.layer_norm.build(input_shape)
+        super().build(input_shape)
+
     def call(self, x):
         # x shape: (batch, timesteps, units)
         d_k     = tf.cast(tf.shape(x)[-1], tf.float32)

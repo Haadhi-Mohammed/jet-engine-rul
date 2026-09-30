@@ -1,6 +1,8 @@
 # tests for the FastAPI service
 # run from the project root:  python -m pytest -q
 
+import json
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -13,6 +15,12 @@ client = TestClient(api.app)
 
 FLEET_SEQUENCES = api.fleet_sequences   # (100, 30, 14) — scaled
 FLEET_PREDS     = api.fleet_preds       # (100,)        — precomputed RUL
+
+
+@pytest.fixture(autouse=True)
+def fresh_rate_limit():
+    # every test starts with an empty rate-limit history, so tests don't affect each other
+    api.predict_limiter.calls.clear()
 
 
 def raw_request(engine_id: int) -> dict:
@@ -45,6 +53,17 @@ def test_fleet_counts_add_up():
     assert body['red_count'] + body['amber_count'] + body['green_count'] == body['total_engines']
 
 
+def test_fleet_includes_actual_rul():
+    engines = {e['engine_id']: e for e in client.get('/fleet').json()['engines']}
+    assert engines[34]['actual_rul'] == api.fleet_true_rul[33] == 7
+
+
+def test_cors_allows_any_origin_but_never_credentials():
+    r = client.get('/health', headers={'Origin': 'https://example.com'})
+    assert r.headers['access-control-allow-origin'] == '*'
+    assert 'access-control-allow-credentials' not in r.headers
+
+
 # ---- /predict ----
 @pytest.mark.parametrize('engine_id', [1, 20, 81])
 def test_predict_with_raw_readings_matches_precomputed(engine_id):
@@ -60,6 +79,41 @@ def test_predict_rejects_wrong_sequence_length():
     assert client.post('/predict', json=body).status_code == 422
 
 
+@pytest.mark.parametrize('bad_value', ['NaN', 'Infinity', '-Infinity'])
+def test_predict_rejects_nan_and_infinity(bad_value):
+    # valid JSON can't hold NaN, but Python's json accepts it — so build the body by hand
+    body = json.dumps(raw_request(1)).replace('"s_2": ', f'"s_2": {bad_value}, "_x": ', 1)
+    r = client.post('/predict', content=body, headers={'Content-Type': 'application/json'})
+    assert r.status_code == 422
+
+
+def test_predict_rejects_implausible_readings():
+    # a real s_2 reading is ~640; 1e30 used to be accepted and returned RUL 96.4
+    body = raw_request(1)
+    body['readings'][4]['s_2'] = 1e30
+    r = client.post('/predict', json=body)
+    assert r.status_code == 422
+    assert 'Cycle 5: s_2' in r.json()['detail']
+
+
+def test_predict_hides_internal_errors(monkeypatch):
+    # if the model crashes, the client gets a generic message, not the stack trace
+    def broken_model(*args, **kwargs):
+        raise RuntimeError('secret internal detail: /opt/render/project/src/models')
+    monkeypatch.setattr(api, 'model', broken_model)
+
+    r = client.post('/predict', json=raw_request(1))
+    assert r.status_code == 500
+    assert 'secret' not in r.text
+    assert r.json()['detail'] == 'Internal error while predicting'
+
+
+def test_predict_is_rate_limited(monkeypatch):
+    monkeypatch.setattr(api, 'predict_limiter', api.RateLimiter(max_calls=2, per_seconds=60))
+    codes = [client.post('/predict', json=raw_request(1)).status_code for _ in range(3)]
+    assert codes == [200, 200, 429]
+
+
 # ---- /engines/{id}/explain — what the dashboard drill-down uses ----
 @pytest.mark.parametrize('engine_id', [1, 20, 34, 81])
 def test_explain_matches_fleet_prediction(engine_id):
@@ -69,6 +123,14 @@ def test_explain_matches_fleet_prediction(engine_id):
     assert body['engine_id'] == engine_id
     assert body['predicted_rul'] == pytest.approx(FLEET_PREDS[engine_id - 1], abs=0.05)
     assert len(body['shap_values']) == len(api.feature_cols)
+
+
+def test_explain_is_deterministic():
+    # SHAP is seeded, so the same engine always gets the same explanation
+    first  = client.get('/engines/20/explain').json()
+    api.explain_fleet_engine.cache_clear()          # force a real recomputation
+    second = client.get('/engines/20/explain').json()
+    assert first == second
 
 
 def test_explain_gives_different_answers_for_different_engines():

@@ -1,16 +1,24 @@
 # api/main.py
 # FastAPI application for Jet Engine RUL Prediction
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, create_model
 from typing import List
+from collections import defaultdict, deque
+from functools import lru_cache
+from pathlib import Path
+import logging
+import threading
+import time
+import warnings
 import numpy as np
 import pandas as pd
 import pickle
 import json
 import shap
-from pathlib import Path
 import uvicorn
 
 import tensorflow as tf
@@ -18,6 +26,15 @@ import tensorflow as tf
 from rul.alerts import get_alert_level
 from rul.config import RED_BELOW, AMBER_BELOW
 from rul.layers import CUSTOM_OBJECTS
+
+# ---- logging ----
+# logging (not print) gives timestamps + levels, and shows up properly in Render's logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+log = logging.getLogger('rul-api')
+
+# SHAP passes inputs to the Keras functional model as a list — harmless, but Keras
+# warns on every call and floods the logs
+warnings.filterwarnings('ignore', message=r'The structure of `inputs` doesn.t match')
 
 # ---- paths ----
 BASE_DIR   = Path(__file__).parent.parent
@@ -37,7 +54,6 @@ with open(MODELS_DIR / 'feature_cols.pkl', 'rb') as f:
     feature_cols = pickle.load(f)
 
 SEQUENCE_LENGTH = config['sequence_length']
-N_FEATURES      = config['n_features']
 RUL_CAP         = config['rul_cap']
 
 # ---- load scaler ----
@@ -51,6 +67,17 @@ if list(scaler.feature_names_in_) != feature_cols:
         f"but feature_cols.pkl says {feature_cols}"
     )
 
+# ---- input sanity limits ----
+# RobustScaler maps each sensor to (value - median) / IQR. training data spans roughly
+# -3 … +11 in those units, so anything beyond ±20 IQRs from the median is not a real
+# engine reading — it's a unit mistake, a typo or garbage, and the model's answer
+# would be meaningless. reject it instead of returning a confident-looking number.
+MAX_ABS_SCALED = 20
+INPUT_RANGES = {
+    col: (round(float(c - MAX_ABS_SCALED * s), 4), round(float(c + MAX_ABS_SCALED * s), 4))
+    for col, c, s in zip(feature_cols, scaler.center_, scaler.scale_)
+}
+
 # ---- model metadata — read from the artifacts, never hardcoded ----
 _arch        = best_config['architecture']
 MODEL_NAME   = f"{_arch['n_gru_layers']}GRU({_arch['gru_units']})+LSTM({_arch['lstm_units']})+Attention"
@@ -63,20 +90,19 @@ model = tf.keras.models.load_model(
     MODELS_DIR / 'best_model.keras',
     custom_objects=CUSTOM_OBJECTS
 )
-print("model loaded successfully")
+log.info("model loaded: %s", MODEL_NAME)
 
 # ---- load SHAP explainer ----
-print("loading SHAP explainer...")
 shap_background = np.load(MODELS_DIR / 'shap_background.npy')
 explainer = shap.GradientExplainer(model, shap_background)
-print("SHAP explainer ready")
+SHAP_SEED = 0   # GradientExplainer samples randomly — fixed seed = same answer every time
+log.info("SHAP explainer ready")
 
-# ---- load precomputed fleet predictions ----
-fleet_preds = np.load(MODELS_DIR / 'y_pred_test.npy')
-print(f"fleet predictions loaded — {len(fleet_preds)} engines")
-
-# last 30 cycles per fleet engine, already scaled — used by /engines/{id}/explain
-fleet_sequences = np.load(MODELS_DIR / 'fleet_sequences.npy')   # (100, 30, 14)
+# ---- load fleet data (the 100 CMAPSS FD001 test engines) ----
+fleet_preds     = np.load(MODELS_DIR / 'y_pred_test.npy')       # (100,)  precomputed RUL
+fleet_sequences = np.load(MODELS_DIR / 'fleet_sequences.npy')   # (100, 30, 14) scaled windows
+fleet_true_rul  = np.load(MODELS_DIR / 'fleet_true_rul.npy')    # (100,)  actual RUL, uncapped
+log.info("fleet loaded: %d engines", len(fleet_preds))
 
 # ---- FastAPI app ----
 app = FastAPI(
@@ -86,20 +112,68 @@ app = FastAPI(
     version='1.0.0'
 )
 
+# public, read-only API with no cookies or logins — so any origin may call it,
+# but credentials are never allowed ('*' + credentials would let any site send
+# a user's cookies along)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=['*'],
-    allow_credentials=True,
-    allow_methods=['*'],
+    allow_credentials=False,
+    allow_methods=['GET', 'POST'],
     allow_headers=['*'],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    # FastAPI's default 422 echoes the offending input back. for NaN/Infinity that
+    # can't be encoded as JSON, so the error response itself crashed (→ 500).
+    # return where + what went wrong, without the input.
+    errors = [{k: e[k] for k in ('loc', 'msg', 'type') if k in e} for e in exc.errors()]
+    return JSONResponse(status_code=422, content={'detail': errors})
+
+
+# ---- rate limiting ----
+class RateLimiter:
+    # sliding window per client: at most max_calls in any per_seconds window.
+    # in-memory, so it's per process — fine for one Render instance.
+    def __init__(self, max_calls: int, per_seconds: float):
+        self.max_calls   = max_calls
+        self.per_seconds = per_seconds
+        self.calls       = defaultdict(deque)
+        self.lock        = threading.Lock()   # FastAPI runs sync endpoints in a thread pool
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        with self.lock:
+            q = self.calls[key]
+            while q and now - q[0] > self.per_seconds:
+                q.popleft()
+            if len(q) >= self.max_calls:
+                return False
+            q.append(now)
+            return True
+
+
+# /predict runs the model + SHAP (CPU-heavy) — cap it so one client can't hog the server
+predict_limiter = RateLimiter(max_calls=30, per_seconds=60)
+
+
+def limit_predict(request: Request):
+    # behind Render's proxy the real client IP is the first entry of X-Forwarded-For
+    forwarded = request.headers.get('x-forwarded-for')
+    client = forwarded.split(',')[0].strip() if forwarded else request.client.host
+    if not predict_limiter.allow(client):
+        raise HTTPException(status_code=429, detail="Too many requests — max 30 predictions per minute")
+
 
 # ---- request / response schemas ----
 # one cycle of raw sensor readings — one float field per model feature.
 # built from feature_cols so the schema can't drift from the model.
+# allow_inf_nan=False: pydantic accepts NaN/Infinity for floats by default
 SensorReading = create_model(
     'SensorReading',
-    **{col: (float, ...) for col in feature_cols}
+    **{col: (float, Field(..., allow_inf_nan=False)) for col in feature_cols}
 )
 
 
@@ -130,6 +204,8 @@ class PredictResponse(BaseModel):
 class EngineStatus(BaseModel):
     engine_id:     int
     predicted_rul: float
+    # known only because this is a benchmark test set — a real fleet wouldn't have it
+    actual_rul:    float
     alert_level:   str
     alert_message: str
 
@@ -157,13 +233,26 @@ def preprocess_readings(readings: List[SensorReading]) -> np.ndarray:
         columns=feature_cols
     )                                          # (30, 14)
     scaled = scaler.transform(raw)             # (30, 14)
+
+    # reject readings far outside anything the model has seen
+    out_of_range = np.argwhere(np.abs(scaled) > MAX_ABS_SCALED)   # [(cycle, sensor), ...]
+    if len(out_of_range):
+        cycle, j = out_of_range[0]
+        col = feature_cols[j]
+        lo, hi = INPUT_RANGES[col]
+        raise HTTPException(
+            status_code=422,
+            detail=f"Cycle {cycle + 1}: {col} = {raw.iloc[cycle, j]} is outside "
+                   f"the plausible range [{lo}, {hi}]"
+        )
+
     return scaled[np.newaxis]                  # (1, 30, 14)
 
 
 def compute_shap(sequence: np.ndarray) -> List[ShapValue]:
     # returns per-sensor importance averaged across all 30 timesteps
     shap_vals = np.array(
-        explainer.shap_values(sequence)
+        explainer.shap_values(sequence, rseed=SHAP_SEED)
     ).squeeze(-1)                              # (1, 30, 14)
 
     mean_importance = np.abs(shap_vals).mean(axis=1)[0]  # (14,)
@@ -177,7 +266,8 @@ def compute_shap(sequence: np.ndarray) -> List[ShapValue]:
 def predict_sequence(engine_id: int, sequence: np.ndarray) -> PredictResponse:
     # shared by /predict and /engines/{id}/explain
     # sequence must already be SCALED, shape (1, 30, 14)
-    raw_pred = model.predict(sequence, verbose=0).flatten()[0]
+    # calling the model directly is much faster than model.predict() for one sample
+    raw_pred = float(model(sequence, training=False).numpy().flatten()[0])
     rul = float(np.clip(raw_pred, 0, RUL_CAP))
 
     alert_level, alert_message = get_alert_level(rul)
@@ -185,9 +275,9 @@ def predict_sequence(engine_id: int, sequence: np.ndarray) -> PredictResponse:
     shap_values = []
     try:
         shap_values = compute_shap(sequence)
-    except Exception as e:
-        print(f"SHAP error: {str(e)}")
-        # API still returns prediction even if SHAP fails
+    except Exception:
+        # API still returns the prediction even if SHAP fails
+        log.exception("SHAP failed for engine %s", engine_id)
 
     return PredictResponse(
         engine_id=engine_id,
@@ -197,6 +287,19 @@ def predict_sequence(engine_id: int, sequence: np.ndarray) -> PredictResponse:
         shap_values=shap_values,
         model_version=MODEL_VERSION
     )
+
+
+def check_engine_id(engine_id: int):
+    if not 1 <= engine_id <= len(fleet_sequences):
+        raise HTTPException(status_code=404, detail=f"Engine {engine_id} not found")
+
+
+@lru_cache(maxsize=None)
+def explain_fleet_engine(engine_id: int) -> PredictResponse:
+    # fleet windows never change and SHAP is seeded, so each engine's answer
+    # is computed once and then served from memory
+    sequence = fleet_sequences[engine_id - 1][np.newaxis]   # (1, 30, 14)
+    return predict_sequence(engine_id, sequence)
 
 
 # ---- endpoints ----
@@ -215,51 +318,44 @@ def root():
         'sequence_length':  SEQUENCE_LENGTH,
         'rul_cap':          RUL_CAP,
         'alert_thresholds': {'red_below': RED_BELOW, 'amber_below': AMBER_BELOW},
+        'input_ranges':     INPUT_RANGES,
     }
 
 
 @app.get('/health')
 def health():
-    # Render pings this — must stay fast, no model inference here
-    return {'status': 'healthy', 'model_loaded': model is not None}
+    # Render pings this — must stay fast, no model inference here.
+    # the model loads at import time, so if this answers, the model is loaded.
+    return {'status': 'healthy', 'model_version': MODEL_VERSION}
 
 
-@app.post('/predict', response_model=PredictResponse)
+@app.post('/predict', response_model=PredictResponse, dependencies=[Depends(limit_predict)])
 def predict(request: PredictRequest):
-    if len(request.readings) != SEQUENCE_LENGTH:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Exactly {SEQUENCE_LENGTH} cycles required. "
-                   f"Got {len(request.readings)}."
-        )
-
+    # raw readings from the caller → validate + scale here, then predict.
+    # length, NaN/Infinity and field checks already happened in PredictRequest (→ 422)
+    sequence = preprocess_readings(request.readings)
     try:
-        # raw readings from the caller → scale here, then predict
-        sequence = preprocess_readings(request.readings)
         return predict_sequence(request.engine_id, sequence)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        # full details go to the server log; the client gets a generic message,
+        # never internal paths, library versions or stack traces
+        log.exception("prediction failed for engine %s", request.engine_id)
+        raise HTTPException(status_code=500, detail="Internal error while predicting")
 
 
 @app.get('/engines/{engine_id}/explain', response_model=PredictResponse)
 def explain_engine(engine_id: int):
     # prediction + SHAP for a fleet engine, using its stored (already scaled) sensor window.
     # the dashboard uses this, so it never has to handle scaling itself.
-    if not 1 <= engine_id <= len(fleet_sequences):
-        raise HTTPException(status_code=404, detail=f"Engine {engine_id} not found")
-
-    sequence = fleet_sequences[engine_id - 1][np.newaxis]   # (1, 30, 14)
-    return predict_sequence(engine_id, sequence)
+    check_engine_id(engine_id)
+    return explain_fleet_engine(engine_id)
 
 
 @app.get('/engines/{engine_id}/sensors', response_model=EngineSensors)
 def engine_sensors(engine_id: int):
     # the stored sensor window for a fleet engine — lets the dashboard draw
     # its charts without shipping its own copy of the data
-    if not 1 <= engine_id <= len(fleet_sequences):
-        raise HTTPException(status_code=404, detail=f"Engine {engine_id} not found")
-
+    check_engine_id(engine_id)
     return EngineSensors(
         engine_id=engine_id,
         feature_cols=feature_cols,
@@ -272,11 +368,12 @@ def fleet():
     # serving precomputed predictions — instant response, no inference
     # sorted by RUL ascending — most critical engines first
     engines = []
-    for i, rul in enumerate(fleet_preds):
+    for i, (rul, actual) in enumerate(zip(fleet_preds, fleet_true_rul)):
         alert_level, alert_message = get_alert_level(float(rul))
         engines.append(EngineStatus(
             engine_id=i + 1,
             predicted_rul=round(float(rul), 2),
+            actual_rul=float(actual),
             alert_level=alert_level,
             alert_message=alert_message
         ))
@@ -297,5 +394,6 @@ def fleet():
 
 
 # ---- run locally ----
+# from the project root:  python -m api.main   (or: uvicorn api.main:app --reload --port 8001)
 if __name__ == '__main__':
-    uvicorn.run('main:app', host='0.0.0.0', port=8001, reload=True)
+    uvicorn.run('api.main:app', host='0.0.0.0', port=8001, reload=True)

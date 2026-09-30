@@ -84,5 +84,6 @@ def test_pipeline_reproduces_saved_arrays():
     np.testing.assert_array_equal(y_train, np.load(PROCESSED / 'y_train.npy'))
     np.testing.assert_array_equal(X_test,  np.load(PROCESSED / 'X_test.npy'))
     np.testing.assert_array_equal(true_rul, np.load(PROCESSED / 'y_test.npy'))
-    # and the API's copy of the fleet windows is the same data
-    np.testing.assert_array_equal(X_test, np.load(MODELS / 'fleet_sequences.npy'))
+    # and the API's copies of the fleet data are the same data
+    np.testing.assert_array_equal(X_test,   np.load(MODELS / 'fleet_sequences.npy'))
+    np.testing.assert_array_equal(true_rul, np.load(MODELS / 'fleet_true_rul.npy'))
