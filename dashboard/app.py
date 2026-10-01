@@ -2,6 +2,7 @@
 # two views: fleet overview + individual engine drill-down
 
 import os
+import time
 import streamlit as st
 import requests
 import pandas as pd
@@ -49,7 +50,7 @@ st.markdown("""
 
 
 # ---- data fetching ----
-@st.cache_data(ttl=3600)  # fleet data is static — "Refresh Data" clears this
+@st.cache_data(ttl=3600, show_spinner=False)  # fleet data is static — "Refresh Data" clears this
 def _api_get(path):
     # raises on failure — Streamlit doesn't cache exceptions, so errors get retried
     r = requests.get(f"{API_URL}{path}", timeout=60)
@@ -57,12 +58,32 @@ def _api_get(path):
     return r.json()
 
 
+# the API sleeps when idle (Render free tier). waking it — new container, load
+# TensorFlow + model + SHAP — can take longer than one request's timeout, so
+# "can't connect / timed out / 502-504" means "still waking up": keep trying.
+# anything else (404, 422, 500) is a real error and retrying won't help.
+WAKE_UP_BUDGET = 180   # seconds
+RETRYABLE_STATUS = {502, 503, 504}
+
+
+def _is_retryable(e: Exception) -> bool:
+    if isinstance(e, (requests.ConnectionError, requests.Timeout)):
+        return True
+    return (isinstance(e, requests.HTTPError) and e.response is not None
+            and e.response.status_code in RETRYABLE_STATUS)
+
+
 def api_get(path):
-    try:
-        return _api_get(path)
-    except Exception as e:
-        st.error(f"API request failed ({path}): {e}")
-        return None
+    deadline = time.monotonic() + WAKE_UP_BUDGET
+    while True:
+        try:
+            return _api_get(path)
+        except Exception as e:
+            if _is_retryable(e) and time.monotonic() < deadline:
+                time.sleep(3)
+                continue
+            st.error(f"API request failed ({path}): {e}")
+            return None
 
 
 # ---- helper ----
@@ -75,7 +96,8 @@ def badge(level):
 
 # ---- model metadata — thresholds, RUL cap, metrics all come from the API ----
 # the API is on a free tier that sleeps when idle — the first request can take ~1 minute
-with st.spinner("Connecting to the prediction API… (first load can take up to a minute while it wakes up)"):
+with st.spinner("Connecting to the prediction API… if it was asleep this takes 1–3 minutes, "
+                "the page will load on its own"):
     meta = api_get("/")
 if not meta:
     st.stop()
