@@ -9,11 +9,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04     # pinned: "latest" moves to a new OS release without warning
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: pip                      # reuse downloaded wheels (TensorFlow is ~600 MB)
@@ -33,12 +33,12 @@ jobs:
     # only after the tests pass, and only for main
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       SPACE: HaadhiMohammed/jet-engine-rul
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Sync dashboard to the Hugging Face Space
         run: |
