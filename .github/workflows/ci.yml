@@ -1,0 +1,63 @@
+# CI: run the tests on every push / PR; on main, deploy the dashboard to the HF Space.
+# (the API deploys itself: Render watches main.)
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip                      # reuse downloaded wheels (TensorFlow is ~600 MB)
+          cache-dependency-path: requirements-api.txt
+
+      - name: Install dependencies
+        # the same pinned versions Render installs, plus the test tools
+        run: pip install -r requirements-api.txt pytest==9.0.3 httpx==0.28.1
+
+      - name: Run tests
+        # tests that need the raw CMAPSS data skip themselves (data/ isn't in git)
+        run: python -m pytest -v -rs
+        env:
+          TF_CPP_MIN_LOG_LEVEL: '3'
+
+  deploy-dashboard:
+    # only after the tests pass, and only for main
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      SPACE: HaadhiMohammed/jet-engine-rul
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync dashboard to the Hugging Face Space
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::warning::HF_TOKEN secret not set — skipping dashboard deploy"
+            exit 0
+          fi
+
+          git clone "https://user:${HF_TOKEN}@huggingface.co/spaces/${SPACE}" space
+          cp dashboard/app.py               space/app.py
+          cp requirements-dashboard.txt     space/requirements.txt
+
+          cd space
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py requirements.txt
+          if git diff --cached --quiet; then
+            echo "dashboard unchanged — nothing to deploy"
+            exit 0
+          fi
+          git commit -m "Sync dashboard from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}"
+          git push
