@@ -29,3 +29,6 @@ desktop.ini
 
 # HuggingFace Space — separate git repo, deployed on its own
 hf-space/
+
+# MLflow tracking database for scripts/train.py
+mlflow.db

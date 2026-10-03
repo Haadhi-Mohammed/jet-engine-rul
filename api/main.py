@@ -80,10 +80,13 @@ INPUT_RANGES = {
 
 # ---- model metadata — read from the artifacts, never hardcoded ----
 _arch        = best_config['architecture']
-MODEL_NAME   = f"{_arch['n_gru_layers']}GRU({_arch['gru_units']})+LSTM({_arch['lstm_units']})+Attention"
-MODEL_VERSION = 'run_02_v1.0'
-_perf        = best_config['performance']
-PERFORMANCE  = f"RMSE {_perf['test_rmse']:.2f} | R² {_perf['test_r2']:.3f}"
+_gru, _lstm  = f"{_arch['n_gru_layers']}GRU({_arch['gru_units']})", f"LSTM({_arch['lstm_units']})"
+MODEL_NAME   = (f"{_lstm}+{_gru}" if _arch.get('reverse_order') else f"{_gru}+{_lstm}") + "+Attention"
+MODEL_VERSION = best_config['model_version']
+# headline = mean ± std over the 5 training seeds (one model's score is partly luck)
+_seeds       = best_config['performance_across_seeds']
+PERFORMANCE  = (f"RMSE {_seeds['rmse']['mean']:.1f} ± {_seeds['rmse']['std']:.1f} | "
+                f"R² {_seeds['r2']['mean']:.2f} (5 seeds)")
 
 # ---- load model ----
 model = tf.keras.models.load_model(
@@ -311,7 +314,9 @@ def root():
         'status':      'running',
         'model':       MODEL_NAME,
         'model_version': MODEL_VERSION,
-        'performance': best_config['performance'],
+        'performance': best_config['performance'],                     # the deployed model
+        'performance_across_seeds': best_config['performance_across_seeds'],
+        'performance_summary': PERFORMANCE,
         'dataset':     'NASA CMAPSS FD001',
         # clients (the dashboard) read these instead of hardcoding them
         'feature_cols':     feature_cols,

@@ -36,6 +36,17 @@ def add_train_rul(train: pd.DataFrame, cap: int = RUL_CAP) -> pd.DataFrame:
     return train
 
 
+def split_engines(train: pd.DataFrame, val_fraction: float = 0.2, seed: int = 42):
+    # hold out WHOLE engines for validation. splitting windows at random would put
+    # overlapping windows of the same engine on both sides — the model would be
+    # validated on data it has almost seen, and the score would look too good.
+    units = train['unit_number'].unique()
+    rng = np.random.default_rng(seed)
+    val_units = rng.choice(units, size=round(len(units) * val_fraction), replace=False)
+    is_val = train['unit_number'].isin(val_units)
+    return train[~is_val].copy(), train[is_val].copy()
+
+
 def fit_scaler(train: pd.DataFrame) -> RobustScaler:
     # fit on TRAINING data only — fitting on test data would leak information
     return RobustScaler().fit(train[FEATURE_COLS])

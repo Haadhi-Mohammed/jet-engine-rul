@@ -1,21 +1,55 @@
 {
+  "model_version": "v2-run_02-seed1",
   "architecture": {
     "n_gru_layers": 2,
     "gru_units": 64,
     "lstm_units": 32,
     "dropout_rate": 0.2,
+    "reverse_order": false,
     "l2_reg": 0.001
   },
   "training": {
     "learning_rate": 0.001,
     "batch_size": 256,
-    "best_epoch": 23
+    "max_epochs": 50,
+    "patience": 10,
+    "seed": 1,
+    "best_epoch": 8,
+    "epochs_run": 18,
+    "split_seed": 42,
+    "train_engines": 80,
+    "val_engines": 20
   },
   "performance": {
-    "test_rmse": 14.0662,
-    "test_mae": 10.1152,
-    "test_r2": 0.8768
+    "test_rmse": 14.9885,
+    "test_mae": 10.9963,
+    "test_r2": 0.8601,
+    "test_nasa_score": 676.0251
   },
+  "performance_across_seeds": {
+    "rmse": {
+      "mean": 14.6646,
+      "std": 0.262
+    },
+    "mae": {
+      "mean": 10.7682,
+      "std": 0.2733
+    },
+    "r2": {
+      "mean": 0.8661,
+      "std": 0.0048
+    },
+    "nasa_score": {
+      "mean": 487.8331,
+      "std": 117.9175
+    }
+  },
+  "validation": {
+    "rmse": 13.6718,
+    "mae": 10.1128,
+    "r2": 0.8931
+  },
+  "evaluation_notes": "model chosen on a 20-engine validation split; test set (100 engines, RUL clipped at 125) used once, after selection",
   "data": {
     "feature_cols": [
       "s_2",

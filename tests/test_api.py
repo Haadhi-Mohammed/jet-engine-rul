@@ -44,7 +44,9 @@ def test_root_exposes_what_clients_need():
     assert body['feature_cols'] == api.feature_cols
     assert body['alert_thresholds'] == {'red_below': 30, 'amber_below': 60}
     assert body['rul_cap'] == api.RUL_CAP
-    assert body['model'] == '2GRU(64)+LSTM(32)+Attention'
+    assert body['model'] == api.MODEL_NAME
+    assert body['model_version'] == api.best_config['model_version']
+    assert set(body['performance_across_seeds']) >= {'rmse', 'r2'}
 
 
 def test_fleet_counts_add_up():

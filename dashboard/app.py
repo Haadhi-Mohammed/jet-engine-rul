@@ -105,7 +105,7 @@ if not meta:
 RED_BELOW   = meta['alert_thresholds']['red_below']
 AMBER_BELOW = meta['alert_thresholds']['amber_below']
 RUL_CAP     = meta['rul_cap']
-perf        = meta['performance']
+seeds       = meta['performance_across_seeds']   # mean ± std over 5 training seeds
 
 
 # ---- sidebar ----
@@ -113,7 +113,10 @@ st.sidebar.markdown("## ✈️")
 st.sidebar.title("Fleet Monitor")
 st.sidebar.markdown(
     f"{meta['dataset']}  \n{meta['model']}  \n"
-    f"RMSE {perf['test_rmse']:.2f} · R² {perf['test_r2']:.3f}"
+    f"RMSE {seeds['rmse']['mean']:.1f} ± {seeds['rmse']['std']:.1f} · "
+    f"R² {seeds['r2']['mean']:.2f}  \n"
+    f"<small>test set, 5 seeds · model chosen on validation engines</small>",
+    unsafe_allow_html=True
 )
 st.sidebar.divider()
 

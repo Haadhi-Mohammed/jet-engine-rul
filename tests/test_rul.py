@@ -26,6 +26,34 @@ def test_alert_levels(rul, level):
     assert get_alert_level(rul)[0] == level
 
 
+def test_nasa_score_penalises_late_predictions_more():
+    from rul.metrics import nasa_score
+    # hand-computed: 10 cycles late → e^(10/10) - 1 = 1.718; 10 early → e^(10/13) - 1 = 1.158
+    assert nasa_score([50], [60]) == pytest.approx(np.e - 1)
+    assert nasa_score([50], [40]) == pytest.approx(np.exp(10 / 13) - 1)
+    assert nasa_score([50], [60]) > nasa_score([50], [40])
+    assert nasa_score([50, 80], [50, 80]) == 0
+
+
+def test_evaluate_clips_to_cap_before_scoring():
+    from rul.metrics import evaluate
+    # true RUL 145 and prediction 125 count as perfect: both mean "healthy, ≥ cap"
+    m = evaluate([145, 10], [125, 10], cap=125)
+    assert m['rmse'] == 0 and m['late_predictions'] == 0
+
+
+def test_split_engines_never_shares_an_engine():
+    import pandas as pd
+    from rul.data import split_engines
+    df = pd.DataFrame({'unit_number': np.repeat(np.arange(1, 101), 5)})
+    tr, val = split_engines(df, val_fraction=0.2, seed=42)
+    assert set(tr['unit_number']).isdisjoint(val['unit_number'])
+    assert val['unit_number'].nunique() == 20
+    assert len(tr) + len(val) == len(df)
+    # same seed → same split, every time
+    assert set(split_engines(df, 0.2, 42)[1]['unit_number']) == set(val['unit_number'])
+
+
 # ---- 2. consistency tests: code constants must match the saved artifacts ----
 # the model was trained with a specific feature list, window length and cap.
 # if someone edits rul/config.py without retraining, these fail.
@@ -65,17 +93,14 @@ needs_data = pytest.mark.skipif(
 
 
 @needs_data
-def test_pipeline_reproduces_saved_arrays():
+def test_pipeline_matches_original_notebook():
+    # the vectorized rul.data functions rebuild 02_preprocessing.ipynb's arrays exactly
+    # (that notebook fitted its scaler on all 100 training engines)
     from rul import data
 
     train, test, true_rul = data.load_cmapss(RAW)
     train  = data.add_train_rul(train)
     scaler = data.fit_scaler(train)
-
-    # the freshly fitted scaler must equal the saved one
-    saved_scaler = load_pickle('scaler.pkl')
-    np.testing.assert_allclose(scaler.center_, saved_scaler.center_)
-    np.testing.assert_allclose(scaler.scale_,  saved_scaler.scale_)
 
     X_train, y_train = data.create_sequences(data.scale(train, scaler))
     X_test = data.last_windows(data.scale(test, scaler))
@@ -84,6 +109,23 @@ def test_pipeline_reproduces_saved_arrays():
     np.testing.assert_array_equal(y_train, np.load(PROCESSED / 'y_train.npy'))
     np.testing.assert_array_equal(X_test,  np.load(PROCESSED / 'X_test.npy'))
     np.testing.assert_array_equal(true_rul, np.load(PROCESSED / 'y_test.npy'))
-    # and the API's copies of the fleet data are the same data
+
+
+@needs_data
+def test_saved_artifacts_match_training_pipeline():
+    # the deployed scaler and fleet data are exactly what scripts/train.py produces:
+    # scaler fitted on the training engines of the fixed split, test windows scaled with it
+    from rul import data
+    from scripts.train import SPLIT_SEED
+
+    train, test, true_rul = data.load_cmapss(RAW)
+    tr, _  = data.split_engines(data.add_train_rul(train), val_fraction=0.2, seed=SPLIT_SEED)
+    scaler = data.fit_scaler(tr)
+
+    saved_scaler = load_pickle('scaler.pkl')
+    np.testing.assert_allclose(scaler.center_, saved_scaler.center_)
+    np.testing.assert_allclose(scaler.scale_,  saved_scaler.scale_)
+
+    X_test = data.last_windows(data.scale(test, scaler))
     np.testing.assert_array_equal(X_test,   np.load(MODELS / 'fleet_sequences.npy'))
     np.testing.assert_array_equal(true_rul, np.load(MODELS / 'fleet_true_rul.npy'))
