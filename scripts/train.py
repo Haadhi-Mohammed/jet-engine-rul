@@ -30,7 +30,9 @@ MODELS_DIR = ROOT / 'models'
 REPORTS    = ROOT / 'reports'
 
 SPLIT_SEED = 42      # which engines go to validation — fixed for every run
+VAL_CUTS   = {'rul_range': (10, 150), 'cuts_per_engine': 20, 'seed': 0}   # test-like validation
 TRAINING = {'learning_rate': 0.001, 'batch_size': 256, 'max_epochs': 50, 'patience': 10}
+VERSION  = 'v3'      # v2 = validated on all windows; v3 = test-like validation cuts
 
 # the same 9 configurations as the original notebook experiment
 CONFIGS = {
@@ -60,9 +62,15 @@ def prepare(include_test: bool):
 
     scaler = data.fit_scaler(tr)        # fitted on the 80 training engines only
     X_tr,  y_tr  = data.create_sequences(data.scale(tr,  scaler))
-    X_val, y_val = data.create_sequences(data.scale(val, scaler))
+    val_scaled   = data.scale(val, scaler)
+    # validation mirrors the test design: each engine cut "some time prior to failure",
+    # scored on its last window. used for early stopping AND model selection.
+    X_val, y_val = data.cut_windows(val_scaled, **VAL_CUTS)
+    # every window of the validation engines — the v2 protocol, kept for comparison only
+    X_val_all, y_val_all = data.create_sequences(val_scaled)
 
-    d = dict(X_tr=X_tr, y_tr=y_tr, X_val=X_val, y_val=y_val, scaler=scaler,
+    d = dict(X_tr=X_tr, y_tr=y_tr, X_val=X_val, y_val=y_val,
+             X_val_all=X_val_all, y_val_all=y_val_all, scaler=scaler,
              n_train_engines=tr['unit_number'].nunique(), n_val_engines=val['unit_number'].nunique())
     if include_test:
         d['X_test'] = data.last_windows(data.scale(test, scaler))
@@ -106,6 +114,8 @@ def train_one(cfg: dict, seed: int, d: dict, extra_callbacks=()):
     }
     y_val_pred = model.predict(d['X_val'], verbose=0).flatten()
     info['val'] = evaluate(d['y_val'], y_val_pred)
+    info['val_all_windows_rmse'] = evaluate(
+        d['y_val_all'], model.predict(d['X_val_all'], verbose=0).flatten())['rmse']
     return model, info
 
 
@@ -120,8 +130,8 @@ def mlflow_setup(experiment: str):
 def run_experiment(seeds, only, out_csv, use_mlflow):
     d = prepare(include_test=False)
     print(f"train: {d['n_train_engines']} engines / {len(d['X_tr'])} windows | "
-          f"val: {d['n_val_engines']} engines / {len(d['X_val'])} windows")
-    mlflow = mlflow_setup('jet_engine_rul_v2_selection') if use_mlflow else None
+          f"val: {d['n_val_engines']} engines / {len(d['X_val'])} test-like cuts")
+    mlflow = mlflow_setup(f'jet_engine_rul_{VERSION}_selection') if use_mlflow else None
 
     rows = []
     for name, cfg in CONFIGS.items():
@@ -133,6 +143,7 @@ def run_experiment(seeds, only, out_csv, use_mlflow):
             row = {'run': name, 'config': describe(cfg), 'seed': seed,
                    'val_rmse': info['val']['rmse'], 'val_mae': info['val']['mae'],
                    'val_nasa': info['val']['nasa_score'],
+                   'val_all_windows_rmse': info['val_all_windows_rmse'],
                    'best_epoch': info['best_epoch'], 'epochs_run': info['epochs_run'],
                    'seconds': round(time.time() - t0)}
             rows.append(row)
@@ -160,7 +171,7 @@ def run_experiment(seeds, only, out_csv, use_mlflow):
 def run_final(run_name, seeds, use_mlflow):
     cfg = CONFIGS[run_name]
     d = prepare(include_test=True)
-    mlflow = mlflow_setup('jet_engine_rul_v2_final') if use_mlflow else None
+    mlflow = mlflow_setup(f'jet_engine_rul_{VERSION}_final') if use_mlflow else None
 
     results, best = [], None
     for seed in seeds:
@@ -191,7 +202,7 @@ def run_final(run_name, seeds, use_mlflow):
     spread = {k: {'mean': float(np.mean([r['test'][k] for r in results])),
                   'std':  float(np.std([r['test'][k] for r in results], ddof=1))}
               for k in test_keys}
-    version = f"v2-{run_name}-seed{info['seed']}"
+    version = f"{VERSION}-{run_name}-seed{info['seed']}"
 
     save_artifacts(model, d, y_pred, cfg, info, spread, version, run_name)
 
@@ -250,8 +261,11 @@ def save_artifacts(model, d, y_pred, cfg, info, spread, version, run_name):
                         if k in ('rmse', 'mae', 'r2', 'nasa_score')},
         'performance_across_seeds': {k: {m: round(v, 4) for m, v in s.items()} for k, s in spread.items()},
         'validation': {k: round(v, 4) for k, v in info['val'].items() if k in ('rmse', 'mae', 'r2')},
-        'evaluation_notes': 'model chosen on a 20-engine validation split; test set (100 engines, '
-                            f'RUL clipped at {RUL_CAP}) used once, after selection',
+        'evaluation_notes': 'model chosen on a 20-engine validation split, scored like the test set: '
+                            f"{VAL_CUTS['cuts_per_engine']} cuts per engine with true RUL uniform in "
+                            f"{list(VAL_CUTS['rul_range'])} (test design per Saxena et al. 2008), last "
+                            f'window only; test set (100 engines, RUL clipped at {RUL_CAP}) used once, after selection',
+        'validation_protocol': {k: list(v) if isinstance(v, tuple) else v for k, v in VAL_CUTS.items()},
         'data': {'feature_cols': FEATURE_COLS, 'sequence_length': SEQUENCE_LENGTH,
                  'n_features': len(FEATURE_COLS), 'rul_cap': RUL_CAP, 'sensors_dropped': SENSORS_TO_DROP},
     }
@@ -264,7 +278,7 @@ if __name__ == '__main__':
     e = sub.add_parser('experiment')
     e.add_argument('--seeds', type=int, default=3)
     e.add_argument('--only', nargs='*', help='run only these configs, e.g. run_02 run_08')
-    e.add_argument('--out', default=str(REPORTS / 'experiments_v2.csv'))
+    e.add_argument('--out', default=str(REPORTS / f'experiments_{VERSION}.csv'))
     e.add_argument('--no-mlflow', action='store_true')
     f = sub.add_parser('final')
     f.add_argument('--run', required=True, help='config name chosen by `experiment`')

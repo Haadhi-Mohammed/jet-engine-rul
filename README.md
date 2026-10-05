@@ -16,35 +16,47 @@ NASA CMAPSS FD001, 100 test engines, RUL capped at 125 cycles (standard for this
 
 | Metric | Mean ± std over 5 training seeds |
 |---|---|
-| RMSE | **14.66 ± 0.26** cycles |
-| MAE | 10.77 ± 0.27 cycles |
-| R² | 0.866 ± 0.005 |
-| NASA score ([Saxena et al., 2008](#data)) | 488 ± 118 |
+| RMSE | **14.26 ± 0.34** cycles |
+| MAE | 10.36 ± 0.25 cycles |
+| R² | 0.873 ± 0.006 |
+| NASA score ([Saxena et al., 2008](#data)) | 407 ± 91 |
 
 How these numbers were produced — and why they can be trusted:
 
 - **Model selection never sees the test set.** 9 architectures × 3 seeds were compared on a
   validation split of **20 held-out engines**; the test set was loaded once, after every decision.
+- **Validation is scored like the test set.** The test engines stop "some time prior to failure"
+  and are judged on their last window. So each validation engine is cut 20 times at a random
+  point (true RUL uniform in 10–150 cycles, the documented test design) and scored on the window
+  before each cut — not on every window of its life, where easy early-life windows dominate.
 - **Split by engine, not by window.** Overlapping windows of one engine never appear on both sides.
 - **Reported as mean ± std over seeds**, because a single run's score is partly luck — individual
-  seeds of the same model range from 14.3 to 15.0 RMSE.
+  seeds of the same model range from 13.7 to 14.6 RMSE.
 - **Reproducible:** fixed seeds and deterministic ops — rerunning gives identical results.
 
-The deployed model is the seed with the best *validation* score (test RMSE 14.99, inside the normal
-spread). An earlier version of this project reported RMSE 14.07; that model had been picked by
-test-set score, which made the number optimistic — see `notebooks/03_training.ipynb`.
+The deployed model is the seed with the best *validation* score (test RMSE 14.22, close to the
+mean). How the reported number evolved, and why:
+
+| Version | Test RMSE | What changed |
+|---|---|---|
+| v1 | 14.07 | picked by test-set score — optimistic, see `notebooks/03_training.ipynb` |
+| v2 | 14.66 ± 0.26 | selection moved to a validation split, scored on every window |
+| **v3** | **14.26 ± 0.34** | validation scored like the test set (above) |
+
+The v3 protocol was decided before its test results were seen; across seeds its validation
+score tracks the test score (correlation +0.56, where v2's was −0.66).
 
 ![Model selection on validation engines](reports/experiment_comparison.png)
 
-**Finding:** smaller is better here — 2 GRU layers match or beat the 3–4 layer stacks
-(including the original dissertation architecture), but the top configurations are within
-seed-to-seed noise of each other.
+**Finding:** smaller is better here — 2 GRU(64) layers + LSTM(32) has the best mean *and* the
+smallest seed-to-seed spread, ahead of the 3–4 layer stacks including the original
+dissertation architecture.
 
 ![Predicted vs actual RUL](reports/predicted_vs_actual.png)
 
-**Known limitation:** the model is optimistic on average (+5.4 cycles; 66 of 100 engines
-get *more* predicted life than they have). In maintenance that is the risky direction —
-an asymmetric loss is the natural next step.
+**Known limitation:** the model is still slightly optimistic (+1.3 cycles on average, down from
++5.4 in v2; 61 of 100 engines get *more* predicted life than they have). In maintenance that is
+the risky direction — an asymmetric loss is the natural next step.
 
 ## How it works
 

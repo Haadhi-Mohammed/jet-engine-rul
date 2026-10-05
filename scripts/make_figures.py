@@ -1,9 +1,9 @@
 """
-Regenerate the result figures in reports/ from the saved v2 results.
+Regenerate the result figures in reports/ from the saved training results.
 
     python -m scripts.make_figures
 
-reads reports/experiments_v2.csv (selection experiment) and the deployed model's
+reads reports/experiments_<VERSION>.csv (selection experiment) and the deployed model's
 test predictions in models/ — no training, runs in seconds.
 """
 
@@ -19,6 +19,7 @@ import pandas as pd
 
 from rul.config import RUL_CAP
 from rul.metrics import evaluate
+from scripts.train import VERSION
 
 ROOT    = Path(__file__).parent.parent
 REPORTS = ROOT / 'reports'
@@ -42,7 +43,7 @@ plt.rcParams.update({
 
 
 def experiment_comparison():
-    df = pd.read_csv(REPORTS / 'experiments_v2.csv')
+    df = pd.read_csv(REPORTS / f'experiments_{VERSION}.csv')
     stats = (df.groupby(['run', 'config'])['val_rmse'].agg(['mean', 'std'])
                .sort_values('mean').reset_index())
     winner = stats.iloc[0]['run']
@@ -63,7 +64,7 @@ def experiment_comparison():
     ax.set_xlabel('validation RMSE (cycles) — lower is better')
     ax.grid(axis='x', color=GRID, linewidth=0.8)
     ax.set_axisbelow(True)
-    ax.set_title('Model selection on 20 held-out validation engines\n'
+    ax.set_title('Model selection on 20 held-out validation engines (400 test-like cuts)\n'
                  'hollow = each of 3 seeds · filled = mean ± std · blue = selected',
                  loc='left', fontsize=11, color=INK)
     fig.tight_layout()

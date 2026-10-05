@@ -72,6 +72,37 @@ def create_sequences(train: pd.DataFrame, seq_len: int = SEQUENCE_LENGTH):
     return np.concatenate(X), np.concatenate(y)
 
 
+def cut_windows(engines: pd.DataFrame, seq_len: int = SEQUENCE_LENGTH,
+                rul_range: tuple[int, int] = (10, 150), cuts_per_engine: int = 20,
+                seed: int = 0, cap: int = RUL_CAP):
+    """
+    test-like evaluation windows from run-to-failure engines.
+
+    the CMAPSS test engines stop "some time prior to failure", and we predict from
+    their last window. scoring a model on EVERY window of an engine's life is a
+    different task: early-life windows (all labelled = cap) are easy and dominate.
+    so mimic the test design instead — cut each engine where its true remaining
+    life is uniformly random in rul_range (10–150 cycles, as documented for the
+    PHM08 test data in Saxena et al. 2008), and keep the last window before the cut.
+    returns X (n, seq_len, features) and y (true RUL at the cut, capped).
+    """
+    rng = np.random.default_rng(seed)
+    lo, hi = rul_range
+    X, y = [], []
+    for _, engine in engines.groupby('unit_number', sort=False):
+        values = engine[FEATURE_COLS].to_numpy()
+        n = len(values)
+        # a cut with true RUL r ends the window at row n-1-r, which needs seq_len rows before it
+        max_rul = min(hi, n - seq_len)
+        if max_rul < lo:
+            continue
+        for r in rng.integers(lo, max_rul + 1, size=cuts_per_engine):
+            end = n - 1 - r
+            X.append(values[end - seq_len + 1:end + 1])
+            y.append(min(r, cap))
+    return np.stack(X), np.array(y)
+
+
 def last_windows(test: pd.DataFrame, seq_len: int = SEQUENCE_LENGTH) -> np.ndarray:
     # test engines stop before failure — we predict from each engine's last seq_len cycles.
     # engines shorter than seq_len are front-padded with zeros. NOTE: after scaling,

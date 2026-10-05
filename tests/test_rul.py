@@ -54,6 +54,34 @@ def test_split_engines_never_shares_an_engine():
     assert set(split_engines(df, 0.2, 42)[1]['unit_number']) == set(val['unit_number'])
 
 
+def test_cut_windows_end_exactly_at_the_cut():
+    import pandas as pd
+    from rul.data import cut_windows
+    # one engine of 200 cycles whose sensor values equal the cycle index → easy to check
+    n = 200
+    df = pd.DataFrame({c: np.arange(n, dtype=float) for c in config.FEATURE_COLS})
+    df['unit_number'] = 1
+    X, y = cut_windows(df, seq_len=30, rul_range=(10, 150), cuts_per_engine=50, seed=0, cap=125)
+
+    assert X.shape == (50, 30, len(config.FEATURE_COLS))
+    last_cycle = X[:, -1, 0]                       # index of the window's last row
+    true_rul = (n - 1) - last_cycle
+    assert ((true_rul >= 10) & (true_rul <= 150)).all()
+    np.testing.assert_array_equal(y, np.minimum(true_rul, 125))   # label = RUL at the cut, capped
+    np.testing.assert_array_equal(X[:, 0, 0], last_cycle - 29)    # 30 consecutive cycles
+    # deterministic for a given seed
+    np.testing.assert_array_equal(y, cut_windows(df, 30, (10, 150), 50, seed=0, cap=125)[1])
+
+
+def test_cut_windows_skips_engines_too_short_to_cut():
+    import pandas as pd
+    from rul.data import cut_windows
+    short = pd.DataFrame({c: np.zeros(35) for c in config.FEATURE_COLS}); short['unit_number'] = 1
+    long  = pd.DataFrame({c: np.zeros(100) for c in config.FEATURE_COLS}); long['unit_number'] = 2
+    X, _ = cut_windows(pd.concat([short, long]), seq_len=30, cuts_per_engine=5)
+    assert len(X) == 5                             # 35 cycles can't leave RUL ≥ 10 with 30 cycles of history
+
+
 # ---- 2. consistency tests: code constants must match the saved artifacts ----
 # the model was trained with a specific feature list, window length and cap.
 # if someone edits rul/config.py without retraining, these fail.
