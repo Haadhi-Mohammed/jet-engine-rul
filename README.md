@@ -84,7 +84,8 @@ scripts/        train.py (experiment + final training), make_figures.py
 api/            FastAPI service
 dashboard/      Streamlit dashboard (deployed to Hugging Face by CI)
 models/         deployed model + scaler + fleet data
-tests/          pytest suite — API contract, input validation, pipeline reproducibility
+tests/          pytest suite — API contract, input validation, load and failure behaviour,
+                dashboard (run against the API in memory), pipeline reproducibility
 notebooks/      original exploration and experiments (kept as a record)
 reports/        figures and results (experiments_v2.csv, final_metrics.json)
 ```
@@ -98,7 +99,7 @@ pip install -r requirements-api.txt -r requirements-dashboard.txt pytest httpx
 
 uvicorn api.main:app --port 8001                          # API → http://localhost:8001/docs
 RUL_API_URL=http://localhost:8001 streamlit run dashboard/app.py   # PowerShell: $env:RUL_API_URL="..."
-python -m pytest                                          # tests
+python -m pytest                                          # tests (2 need data/raw/ and skip without it)
 ```
 
 ### Retrain
@@ -106,6 +107,7 @@ python -m pytest                                          # tests
 Download the [CMAPSS data](#data) into `data/raw/`, then:
 
 ```bash
+pip install -r requirements-dev.txt         # full environment: training, MLflow, notebooks
 python -m scripts.train experiment          # 9 configs × 3 seeds, ranked on validation (~1 h on CPU)
 python -m scripts.train final --run run_02  # 5 seeds, one test evaluation, writes models/
 python -m scripts.make_figures              # regenerate the figures above

@@ -9,6 +9,8 @@ on:
 
 jobs:
   test:
+    # a PR from a branch of this repo is already tested by its push — only run for PRs from forks
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04     # pinned: "latest" moves to a new OS release without warning
     steps:
       - uses: actions/checkout@v5
@@ -17,11 +19,13 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip                      # reuse downloaded wheels (TensorFlow is ~600 MB)
-          cache-dependency-path: requirements-api.txt
+          cache-dependency-path: |
+            requirements-api.txt
+            requirements-dashboard.txt
 
       - name: Install dependencies
-        # the same pinned versions Render installs, plus the test tools
-        run: pip install -r requirements-api.txt pytest==9.0.3 httpx==0.28.1
+        # the pinned versions Render and the HF Space install, plus the test tools
+        run: pip install -r requirements-api.txt -r requirements-dashboard.txt pytest==9.0.3 httpx==0.28.1
 
       - name: Run tests
         # tests that need the raw CMAPSS data skip themselves (data/ isn't in git)

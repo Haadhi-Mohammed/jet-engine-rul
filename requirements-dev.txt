@@ -1,3 +1,5 @@
+# Full development environment (notebooks, MLflow, training, tests) — a pip freeze.
+# The deployed services use requirements-api.txt and requirements-dashboard.txt.
 absl-py==2.4.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.5

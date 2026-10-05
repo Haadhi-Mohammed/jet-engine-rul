@@ -32,3 +32,6 @@ hf-space/
 
 # MLflow tracking database for scripts/train.py
 mlflow.db
+
+# outputs of the old notebooks (kept apart from the live model files)
+models/notebook_v1/
