@@ -133,7 +133,8 @@ if st.sidebar.button("Refresh Data"):
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(
-    "<small>Built by Haadhi Mohammed  \n"
+    f"<small>Model {meta['model_version']}  \n"
+    "Built by Haadhi Mohammed  \n"
     "[GitHub](https://github.com/Haadhi-Mohammed/jet-engine-rul)</small>",
     unsafe_allow_html=True
 )
