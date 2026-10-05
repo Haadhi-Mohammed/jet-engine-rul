@@ -95,7 +95,10 @@ def test_predict_rejects_implausible_readings():
     body['readings'][4]['s_2'] = 1e30
     r = client.post('/predict', json=body)
     assert r.status_code == 422
-    assert 'Cycle 5: s_2' in r.json()['detail']
+    error = r.json()['detail'][0]                   # same list shape as pydantic's 422s
+    assert error['loc'] == ['body', 'readings', 4, 's_2']
+    assert error['type'] == 'value_out_of_range'
+    assert 'plausible range' in error['msg']
 
 
 def test_predict_hides_internal_errors(monkeypatch):
@@ -130,7 +133,7 @@ def test_explain_matches_fleet_prediction(engine_id):
 def test_explain_is_deterministic():
     # SHAP is seeded, so the same engine always gets the same explanation
     first  = client.get('/engines/20/explain').json()
-    api.explain_fleet_engine.cache_clear()          # force a real recomputation
+    api.explain_cache.clear()                       # force a real recomputation
     second = client.get('/engines/20/explain').json()
     assert first == second
 
@@ -153,3 +156,57 @@ def test_sensors_returns_the_stored_window():
     body = client.get('/engines/34/sensors').json()
     assert body['feature_cols'] == api.feature_cols
     np.testing.assert_allclose(body['scaled_readings'], FLEET_SEQUENCES[33], atol=1e-4)
+
+
+# ---- behaviour under failure and load ----
+def test_shap_failure_is_not_cached(monkeypatch):
+    # a one-off SHAP error must not stick: the next request should get a full explanation
+    api.explain_cache.clear()
+    real_shap = api.compute_shap
+
+    def failing_shap(sequence):
+        raise RuntimeError('transient')
+    monkeypatch.setattr(api, 'compute_shap', failing_shap)
+    assert client.get('/engines/5/explain').json()['shap_values'] == []
+
+    monkeypatch.setattr(api, 'compute_shap', real_shap)       # the problem goes away
+    assert len(client.get('/engines/5/explain').json()['shap_values']) == len(api.feature_cols)
+
+
+def test_busy_server_answers_503_quickly(monkeypatch):
+    # while another computation holds the slot, a new one waits BUSY_TIMEOUT, then gets 503
+    api.explain_cache.clear()
+    monkeypatch.setattr(api, 'BUSY_TIMEOUT', 0.1)
+    api.COMPUTE_LOCK.acquire()
+    try:
+        r = client.post('/predict', json=raw_request(1))
+        assert r.status_code == 503
+        assert r.headers['retry-after'] == '5'
+        assert client.get('/engines/7/explain').status_code == 503
+    finally:
+        api.COMPUTE_LOCK.release()
+    assert client.post('/predict', json=raw_request(1)).status_code == 200
+
+
+def test_concurrent_requests_all_succeed_with_identical_answers():
+    # several requests at once: none fail, and seeded SHAP gives every one the same answer
+    from concurrent.futures import ThreadPoolExecutor
+
+    def call(_):
+        with TestClient(api.app) as c:
+            return c.post('/predict', json=raw_request(20)).json()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(call, range(4)))
+    assert all(r == results[0] for r in results)
+    assert len(results[0]['shap_values']) == len(api.feature_cols)
+
+
+def test_rate_limiter_forgets_idle_clients():
+    limiter = api.RateLimiter(max_calls=5, per_seconds=0.05)
+    for i in range(100):
+        limiter.allow(f'client-{i}')
+    import time
+    time.sleep(0.1)
+    limiter.allow('new-client')                     # triggers the sweep
+    assert list(limiter.calls) == ['new-client']

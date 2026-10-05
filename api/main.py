@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, create_model
 from typing import List
 from collections import defaultdict, deque
-from functools import lru_cache
+from contextlib import contextmanager
 from pathlib import Path
 import logging
 import threading
@@ -108,11 +108,12 @@ fleet_true_rul  = np.load(MODELS_DIR / 'fleet_true_rul.npy')    # (100,)  actual
 log.info("fleet loaded: %d engines", len(fleet_preds))
 
 # ---- FastAPI app ----
+API_VERSION = '2.0.0'
 app = FastAPI(
     title='Jet Engine RUL Prediction API',
     description=f'Predictive maintenance API for NASA CMAPSS turbofan engines. '
                 f'{PERFORMANCE} | {MODEL_NAME}',
-    version='1.0.0'
+    version=API_VERSION
 )
 
 # public, read-only API with no cookies or logins — so any origin may call it,
@@ -145,10 +146,19 @@ class RateLimiter:
         self.per_seconds = per_seconds
         self.calls       = defaultdict(deque)
         self.lock        = threading.Lock()   # FastAPI runs sync endpoints in a thread pool
+        self.last_sweep  = time.monotonic()
+
+    def _sweep(self, now: float):
+        # forget clients with no calls inside the window, so the table can't grow forever
+        for key in [k for k, q in self.calls.items() if not q or now - q[-1] > self.per_seconds]:
+            del self.calls[key]
+        self.last_sweep = now
 
     def allow(self, key: str) -> bool:
         now = time.monotonic()
         with self.lock:
+            if now - self.last_sweep > self.per_seconds:
+                self._sweep(now)
             q = self.calls[key]
             while q and now - q[0] > self.per_seconds:
                 q.popleft()
@@ -163,11 +173,35 @@ predict_limiter = RateLimiter(max_calls=30, per_seconds=60)
 
 
 def limit_predict(request: Request):
-    # behind Render's proxy the real client IP is the first entry of X-Forwarded-For
+    # behind Render's proxy the client IP is the first entry of X-Forwarded-For.
+    # NOTE: only trustworthy because the platform's proxies (Cloudflare → Render) set
+    # this header; run the API directly on the internet and clients could fake it.
+    # compute_slot() below protects the server regardless of who the client claims to be.
     forwarded = request.headers.get('x-forwarded-for')
     client = forwarded.split(',')[0].strip() if forwarded else request.client.host
     if not predict_limiter.allow(client):
         raise HTTPException(status_code=429, detail="Too many requests — max 30 predictions per minute")
+
+
+# ---- one heavy computation at a time ----
+# the model + SHAP are CPU- and memory-heavy. in a load test, 8 at once on the 512 MB
+# free instance produced 502/503s. so they run one at a time; a request that can't get
+# its turn within BUSY_TIMEOUT gets a quick 503 + Retry-After instead of piling up.
+# (one at a time also keeps SHAP deterministic: GradientExplainer's seed calls
+#  np.random.seed(), which is global to the whole process.)
+COMPUTE_LOCK = threading.Lock()
+BUSY_TIMEOUT = 10   # seconds
+
+
+@contextmanager
+def compute_slot():
+    if not COMPUTE_LOCK.acquire(timeout=BUSY_TIMEOUT):
+        raise HTTPException(status_code=503, detail="Server busy — please retry shortly",
+                            headers={'Retry-After': '5'})
+    try:
+        yield
+    finally:
+        COMPUTE_LOCK.release()
 
 
 # ---- request / response schemas ----
@@ -237,17 +271,18 @@ def preprocess_readings(readings: List[SensorReading]) -> np.ndarray:
     )                                          # (30, 14)
     scaled = scaler.transform(raw)             # (30, 14)
 
-    # reject readings far outside anything the model has seen
+    # reject readings far outside anything the model has seen.
+    # same error shape as pydantic's 422s, so clients handle one format
     out_of_range = np.argwhere(np.abs(scaled) > MAX_ABS_SCALED)   # [(cycle, sensor), ...]
     if len(out_of_range):
-        cycle, j = out_of_range[0]
+        cycle, j = (int(v) for v in out_of_range[0])
         col = feature_cols[j]
         lo, hi = INPUT_RANGES[col]
-        raise HTTPException(
-            status_code=422,
-            detail=f"Cycle {cycle + 1}: {col} = {raw.iloc[cycle, j]} is outside "
-                   f"the plausible range [{lo}, {hi}]"
-        )
+        raise HTTPException(status_code=422, detail=[{
+            'loc':  ['body', 'readings', cycle, col],
+            'msg':  f"{col} = {raw.iloc[cycle, j]} is outside the plausible range [{lo}, {hi}]",
+            'type': 'value_out_of_range',
+        }])
 
     return scaled[np.newaxis]                  # (1, 30, 14)
 
@@ -297,12 +332,24 @@ def check_engine_id(engine_id: int):
         raise HTTPException(status_code=404, detail=f"Engine {engine_id} not found")
 
 
-@lru_cache(maxsize=None)
+# fleet windows never change and SHAP is seeded, so each engine's answer is
+# computed once and then served from memory
+explain_cache: dict[int, PredictResponse] = {}
+
+
 def explain_fleet_engine(engine_id: int) -> PredictResponse:
-    # fleet windows never change and SHAP is seeded, so each engine's answer
-    # is computed once and then served from memory
+    if engine_id in explain_cache:
+        return explain_cache[engine_id]
+
     sequence = fleet_sequences[engine_id - 1][np.newaxis]   # (1, 30, 14)
-    return predict_sequence(engine_id, sequence)
+    with compute_slot():
+        result = predict_sequence(engine_id, sequence)
+
+    # only cache complete answers — if SHAP failed this time, try again next request
+    # instead of serving an empty explanation until the server restarts
+    if result.shap_values:
+        explain_cache[engine_id] = result
+    return result
 
 
 # ---- endpoints ----
@@ -310,7 +357,7 @@ def explain_fleet_engine(engine_id: int) -> PredictResponse:
 def root():
     return {
         'name':        'Jet Engine RUL Prediction API',
-        'version':     '1.0.0',
+        'version':     API_VERSION,
         'status':      'running',
         'model':       MODEL_NAME,
         'model_version': MODEL_VERSION,
@@ -339,13 +386,14 @@ def predict(request: PredictRequest):
     # raw readings from the caller → validate + scale here, then predict.
     # length, NaN/Infinity and field checks already happened in PredictRequest (→ 422)
     sequence = preprocess_readings(request.readings)
-    try:
-        return predict_sequence(request.engine_id, sequence)
-    except Exception:
-        # full details go to the server log; the client gets a generic message,
-        # never internal paths, library versions or stack traces
-        log.exception("prediction failed for engine %s", request.engine_id)
-        raise HTTPException(status_code=500, detail="Internal error while predicting")
+    with compute_slot():                    # outside the try: a 503 "busy" must not become a 500
+        try:
+            return predict_sequence(request.engine_id, sequence)
+        except Exception:
+            # full details go to the server log; the client gets a generic message,
+            # never internal paths, library versions or stack traces
+            log.exception("prediction failed for engine %s", request.engine_id)
+            raise HTTPException(status_code=500, detail="Internal error while predicting")
 
 
 @app.get('/engines/{engine_id}/explain', response_model=PredictResponse)
