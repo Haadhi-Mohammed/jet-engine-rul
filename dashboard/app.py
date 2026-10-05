@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
+from plotly.subplots import make_subplots
 
 # ---- config ----
 # override with RUL_API_URL=http://localhost:8001 to test against a local API
@@ -62,7 +63,7 @@ def _api_get(path):
 # TensorFlow + model + SHAP — can take longer than one request's timeout, so
 # "can't connect / timed out / 502-504" means "still waking up": keep trying.
 # anything else (404, 422, 500) is a real error and retrying won't help.
-WAKE_UP_BUDGET = 180   # seconds
+WAKE_UP_BUDGET = float(os.environ.get("RUL_API_WAKE_BUDGET", 180))   # seconds (tests set 0)
 RETRYABLE_STATUS = {502, 503, 504}
 
 
@@ -87,7 +88,13 @@ def api_get(path):
 
 
 # ---- helper ----
+# red/amber/green mean alert levels and nothing else on this dashboard;
+# other data (sensors, SHAP) uses one neutral data colour
 LEVEL_COLORS = {'RED': '#e53e3e', 'AMBER': '#d69e2e', 'GREEN': '#38a169'}
+DATA_COLOR   = '#2a78d6'
+# translucent versions of the alert colours — readable on light and dark themes
+LEVEL_TINTS  = {'RED': 'rgba(229,62,62,0.15)', 'AMBER': 'rgba(214,158,46,0.15)',
+                'GREEN': 'rgba(56,161,105,0.15)'}
 
 
 def badge(level):
@@ -225,10 +232,7 @@ if view == "Fleet Overview":
 
         # colour-coded table
         def highlight_row(row):
-            color_map = {'RED':   'rgba(229,62,62,0.15)',
-                         'AMBER': 'rgba(214,158,46,0.15)',
-                         'GREEN': 'rgba(56,161,105,0.15)'}
-            color = color_map.get(row['Alert Level'], 'transparent')
+            color = LEVEL_TINTS.get(row['Alert Level'], 'transparent')
             return [f'background-color: {color}'] * len(row)
 
         st.dataframe(
@@ -251,11 +255,7 @@ if view == "Fleet Overview":
         fig_hist = px.histogram(
             df, x='Predicted RUL', nbins=20,
             color='Alert Level',
-            color_discrete_map={
-                'RED': '#e53e3e',
-                'AMBER': '#d69e2e',
-                'GREEN': '#38a169'
-            },
+            color_discrete_map=LEVEL_COLORS,
             labels={'Predicted RUL': 'Predicted RUL (cycles)'}
         )
         fig_hist.add_vline(x=RED_BELOW,   line_dash='dash', line_color=LEVEL_COLORS['RED'],   opacity=0.5)
@@ -294,9 +294,9 @@ if view == "Fleet Overview":
         for col, (_, row) in zip(cols, critical.iterrows()):
             with col:
                 st.markdown(f"""
-                <div class="engine-card" style="border-left:4px solid #e53e3e;">
+                <div class="engine-card" style="border-left:4px solid {LEVEL_COLORS['RED']};">
                     <div style="font-size:1.3rem;font-weight:700">Engine {int(row['Engine ID'])}</div>
-                    <div style="font-size:2rem;font-weight:700;color:#e53e3e">{row['Predicted RUL']:.1f}</div>
+                    <div style="font-size:2rem;font-weight:700;color:{LEVEL_COLORS['RED']}">{row['Predicted RUL']:.1f}</div>
                     <div class="muted" style="font-size:0.8rem">cycles remaining · actual {row['Actual RUL']:.0f}</div>
                 </div>""", unsafe_allow_html=True)
 
@@ -356,43 +356,33 @@ else:
 
         with col_charts:
             st.subheader(f"Sensor Trends — Last {n_cycles} Cycles")
-            st.markdown("*Scaled values — 0 = median reading across the training fleet*")
 
-            # the 6 sensors driving THIS engine's prediction (falls back to
-            # the first 6 features if SHAP is unavailable)
+            # the 4 sensors driving THIS engine's prediction (falls back to
+            # the first 4 features if SHAP is unavailable)
             if pred and pred.get('shap_values'):
-                top_sensors = [s['sensor'] for s in pred['shap_values'][:6]]
+                top_sensors = [s['sensor'] for s in pred['shap_values'][:4]]
             else:
-                top_sensors = feature_cols[:6]
-            top_indices = [feature_cols.index(s) for s in top_sensors]
+                top_sensors = feature_cols[:4]
 
-            fig_sensors = go.Figure()
+            # small multiples: one panel per sensor, named by its title — colour isn't
+            # needed to tell them apart, so it works in dark mode and for colour-blind viewers
             cycles = list(range(1, n_cycles + 1))
-
-            colors_sensors = [
-                '#e53e3e', '#d69e2e', '#38a169',
-                '#3182ce', '#805ad5', '#dd6b20'
-            ]
-
-            for sensor, idx, c in zip(top_sensors, top_indices, colors_sensors):
+            fig_sensors = make_subplots(rows=2, cols=2, subplot_titles=top_sensors,
+                                        shared_xaxes=True, vertical_spacing=0.18)
+            for i, sensor in enumerate(top_sensors):
+                row, col = i // 2 + 1, i % 2 + 1
                 fig_sensors.add_trace(go.Scatter(
-                    x=cycles,
-                    y=engine_seq[:, idx],
-                    name=sensor,
-                    line=dict(color=c, width=1.5),
-                    mode='lines'
-                ))
-
-            fig_sensors.add_hline(y=0, line_dash='dash', line_color='gray',
-                                  opacity=0.4, annotation_text='training median')
-            fig_sensors.update_layout(
-                xaxis_title=f'cycle (last {n_cycles})',
-                yaxis_title='scaled sensor value',
-                legend=dict(orientation='h', y=-0.2),
-                margin=dict(t=10, b=60, l=10, r=10),
-                height=320
-            )
+                    x=cycles, y=engine_seq[:, feature_cols.index(sensor)],
+                    name=sensor, mode='lines', line=dict(color=DATA_COLOR, width=2),
+                    hovertemplate=f'{sensor}<br>cycle %{{x}}: %{{y:.2f}}<extra></extra>'
+                ), row=row, col=col)
+                fig_sensors.add_hline(y=0, line_dash='dash', line_color='gray',
+                                      opacity=0.4, row=row, col=col)
+            fig_sensors.update_layout(showlegend=False, height=360,
+                                      margin=dict(t=30, b=30, l=10, r=10))
+            fig_sensors.update_xaxes(title_text=f'cycle (last {n_cycles})', row=2)
             st.plotly_chart(fig_sensors, width='stretch')
+            st.caption("Dashed line = 0 = the training fleet's median reading for that sensor.")
 
             # RUL gauge
             st.subheader("RUL Gauge")
@@ -404,9 +394,9 @@ else:
                     'axis': {'range': [0, RUL_CAP]},
                     'bar':  {'color': color},
                     'steps': [
-                        {'range': [0, RED_BELOW],           'color': '#fff0f0'},
-                        {'range': [RED_BELOW, AMBER_BELOW], 'color': '#fffbeb'},
-                        {'range': [AMBER_BELOW, RUL_CAP],   'color': '#f0fff4'},
+                        {'range': [0, RED_BELOW],           'color': LEVEL_TINTS['RED']},
+                        {'range': [RED_BELOW, AMBER_BELOW], 'color': LEVEL_TINTS['AMBER']},
+                        {'range': [AMBER_BELOW, RUL_CAP],   'color': LEVEL_TINTS['GREEN']},
                     ],
                     'threshold': {
                         'line': {'color': LEVEL_COLORS['RED'], 'width': 3},
@@ -434,11 +424,7 @@ else:
                     x=shap_df['importance'],
                     y=shap_df['sensor'],
                     orientation='h',
-                    marker_color=[
-                        '#e53e3e' if v > shap_df['importance'].median()
-                        else '#3182ce'
-                        for v in shap_df['importance']
-                    ],
+                    marker_color=DATA_COLOR,     # bar length shows importance; red would read as "alert"
                     text=[f"{v:.3f}" for v in shap_df['importance']],
                     textposition='outside'
                 ))
